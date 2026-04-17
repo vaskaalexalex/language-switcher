@@ -9,23 +9,30 @@ A tiny local menu-bar app that fixes text typed in the wrong keyboard layout
 - **Runs at login** (optional).
 - **100% local.** No network calls, no analytics, nothing phones home.
 
-## Install (pre-built)
+## Install (DMG)
 
-Grab the latest `.dmg` from the
-[GitHub Releases](../../releases) page:
+Download the latest `.dmg` from
+[GitHub Releases](https://github.com/vaskaalexalex/language-switcher/releases/latest).
 
-1. Open the downloaded `LanguageSwitcher-<version>.dmg`.
-2. Drag `LanguageSwitcher.app` into `Applications`.
-3. Because the app is self-signed (not notarized), the first launch shows a
-   Gatekeeper warning. Right-click the app → **Open** → **Open** in the
-   dialog. Or run once:
+1. Download `LanguageSwitcher-<version>.dmg` from the latest release.
+2. Open the DMG and drag `LanguageSwitcher.app` into `Applications`.
+3. Because the app is self-signed (not notarized), remove the quarantine flag
+   before first launch:
 
    ```bash
    xattr -dr com.apple.quarantine /Applications/LanguageSwitcher.app
    ```
 
-4. On first launch, macOS will prompt for **Accessibility** permission.
-   Grant it in **System Settings → Privacy & Security → Accessibility**.
+4. Open `LanguageSwitcher.app`. If macOS still warns about the app, right-click
+   it in `Applications` and choose **Open** → **Open** once.
+5. On first launch, macOS will prompt for **Accessibility** permission. Grant
+   it in **System Settings → Privacy & Security → Accessibility**.
+
+Optional: verify the downloaded DMG checksum before opening it:
+
+```bash
+shasum -a 256 ~/Downloads/LanguageSwitcher-<version>.dmg
+```
 
 ## Stack
 

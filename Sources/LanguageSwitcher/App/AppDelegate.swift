@@ -13,6 +13,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Log.info("=== LanguageSwitcher launching (pid=\(ProcessInfo.processInfo.processIdentifier)) ===")
         NSApp.setActivationPolicy(.accessory)
 
+        Installer.performPostInstallHousekeeping()
+
         Preferences.shared.seedDefaultsIfNeeded()
 
         statusItemController = StatusItemController(

@@ -34,6 +34,12 @@ CONTENTS="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS/MacOS"
 RES_DIR="$CONTENTS/Resources"
 
+ICON_ICNS="$ROOT/Resources/AppIcon.icns"
+if [ ! -f "$ICON_ICNS" ] || [ "$ROOT/scripts/make-icon.swift" -nt "$ICON_ICNS" ]; then
+  echo "==> generating AppIcon.icns"
+  swift "$ROOT/scripts/make-icon.swift" "$ROOT/Resources"
+fi
+
 echo "==> swift build ($CONFIG)"
 swift build -c "$CONFIG" --product "$APP_NAME"
 
@@ -45,6 +51,7 @@ mkdir -p "$MACOS_DIR" "$RES_DIR"
 
 cp "$BIN_PATH" "$MACOS_DIR/$APP_NAME"
 cp "$ROOT/Resources/Info.plist" "$CONTENTS/Info.plist"
+cp "$ICON_ICNS" "$RES_DIR/AppIcon.icns"
 
 # Create PkgInfo
 printf 'APPL????' > "$CONTENTS/PkgInfo"

@@ -6,3 +6,4 @@ dist/
 Package.resolved
 *.xcodeproj
 DerivedData/
+Resources/AppIcon.iconset/

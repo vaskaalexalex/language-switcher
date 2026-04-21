@@ -128,6 +128,13 @@ final class TextReplacer {
 
     /// Inspects `AXValue` + the caret hint and returns the last whitespace-
     /// delimited token before the caret. Nil if AX doesn't expose the value.
+    ///
+    /// Chrome/Electron-based apps (incl. Cursor, Slack, VS Code) routinely
+    /// lie about the caret position — most visibly right after a paste, when
+    /// AX "freezes" the caret inside or at the boundary of the pasted
+    /// content and doesn't advance it as the user keeps typing. A naive
+    /// scan-back-to-whitespace from that stale index would truncate the
+    /// user's last-typed word, converting only a tail (or head) of it.
     @MainActor
     private func computeLastTokenTarget(in element: AXUIElement, caretHint: Int?) -> TokenTarget? {
         guard let fullText = AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String) else {
@@ -136,22 +143,69 @@ final class TextReplacer {
         let ns = fullText as NSString
         guard ns.length > 0 else { return nil }
 
-        // Chrome/Electron commonly report caret=0 even when it's at the end.
-        // Fall back to end-of-text in that case.
-        var caret = caretHint ?? ns.length
-        if caret <= 0 || caret > ns.length { caret = ns.length }
-
         let whitespace = CharacterSet.whitespacesAndNewlines
+
+        // End of the text with any trailing whitespace trimmed — the natural
+        // "end of what the user has typed so far".
+        var effectiveEnd = ns.length
+        while effectiveEnd > 0 {
+            let ch = ns.substring(with: NSRange(location: effectiveEnd - 1, length: 1))
+            if let scalar = ch.unicodeScalars.first, whitespace.contains(scalar) {
+                effectiveEnd -= 1
+            } else {
+                break
+            }
+        }
+        guard effectiveEnd > 0 else { return nil }
+
+        // 1) Normalise the caret hint. A missing, zero, or out-of-range
+        //    hint is a well-known Electron quirk — snap to effectiveEnd.
+        var caret = caretHint ?? effectiveEnd
+        if caret <= 0 || caret > ns.length { caret = effectiveEnd }
+        if caret > effectiveEnd { caret = effectiveEnd }
+
+        // 2) If the caret is strictly inside a run of non-whitespace
+        //    characters (non-WS on both sides), the hint is stale: the user
+        //    is mid-word and AX just didn't keep up. Snap to effectiveEnd
+        //    so we grab the whole word they actually typed.
+        if caret > 0 && caret < effectiveEnd {
+            let prev = ns.substring(with: NSRange(location: caret - 1, length: 1))
+            let at   = ns.substring(with: NSRange(location: caret, length: 1))
+            let prevIsWS = prev.unicodeScalars.first.map { whitespace.contains($0) } ?? true
+            let atIsWS   = at.unicodeScalars.first.map { whitespace.contains($0) } ?? true
+            if !prevIsWS && !atIsWS {
+                Log.info("AX caret \(caret) sits inside a non-WS run; snapping to end \(effectiveEnd)")
+                caret = effectiveEnd
+            }
+        }
+
+        var start = scanBackToWhitespace(in: ns, from: caret, whitespace: whitespace)
+
+        // 3) If the scan ran all the way back to position 0 while there is
+        //    still non-whitespace content past the caret, the caret was
+        //    almost certainly stale (typical post-paste scenario: AX caret
+        //    parked at the end of the pasted URL, typed word sits past it
+        //    with a single space between). Re-run from effectiveEnd.
+        if start == 0 && caret < effectiveEnd {
+            Log.info("Scan reached text start with content past caret; retrying from end \(effectiveEnd)")
+            caret = effectiveEnd
+            start = scanBackToWhitespace(in: ns, from: caret, whitespace: whitespace)
+        }
+
+        let length = caret - start
+        guard length > 0 else { return nil }
+        let snippet = ns.substring(with: NSRange(location: start, length: length))
+        return TokenTarget(start: start, length: length, snippet: snippet)
+    }
+
+    private func scanBackToWhitespace(in ns: NSString, from caret: Int, whitespace: CharacterSet) -> Int {
         var start = caret
         while start > 0 {
             let prev = ns.substring(with: NSRange(location: start - 1, length: 1))
             if let scalar = prev.unicodeScalars.first, whitespace.contains(scalar) { break }
             start -= 1
         }
-        let length = caret - start
-        guard length > 0 else { return nil }
-        let snippet = ns.substring(with: NSRange(location: start, length: length))
-        return TokenTarget(start: start, length: length, snippet: snippet)
+        return start
     }
 
     // MARK: - Known-length synthetic selection (fast)

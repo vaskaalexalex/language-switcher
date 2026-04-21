@@ -28,7 +28,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     func install() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
-            let image = NSImage(systemSymbolName: "character.bubble", accessibilityDescription: "LanguageSwitcher")
+            let image = NSImage(systemSymbolName: "arrow.left.arrow.right", accessibilityDescription: "LanguageSwitcher")
             image?.isTemplate = true
             button.image = image
         }

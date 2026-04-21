@@ -6,7 +6,12 @@ A tiny local menu-bar app that fixes text typed in the wrong keyboard layout
 - **With a selection** → converts the selection.
 - **Without a selection** → converts the word immediately to the left of the caret.
 - **Per-app exceptions** — disable the app in Terminal, password managers, etc.
-- **Runs at login** (optional).
+- **Runs at login by default** — enabled automatically the first time the app
+  launches from `/Applications`. Toggle it off in Settings if you don't want it.
+- **Self-cleaning install** — when launched from a DMG, the app offers to
+  install itself into `/Applications`. Once installed, it ejects any leftover
+  `LanguageSwitcher` volumes and moves the downloaded `.dmg` from
+  `~/Downloads` to the Trash on next launch.
 - **100% local.** No network calls, no analytics, nothing phones home.
 
 ## Install (DMG)
@@ -15,18 +20,30 @@ Download the latest `.dmg` from
 [GitHub Releases](https://github.com/vaskaalexalex/language-switcher/releases/latest).
 
 1. Download `LanguageSwitcher-<version>.dmg` from the latest release.
-2. Open the DMG and drag `LanguageSwitcher.app` into `Applications`.
-3. Because the app is self-signed (not notarized), remove the quarantine flag
-   before first launch:
+2. Open the DMG and double-click `LanguageSwitcher.app`. On first launch the
+   app detects it's running from a mounted disk image and offers to install
+   itself into `/Applications`. Accept — the app then:
+   - copies itself to `/Applications`,
+   - relaunches from the installed location,
+   - ejects the mounted DMG volume,
+   - moves the `LanguageSwitcher-<version>.dmg` file in `~/Downloads` to
+     the Trash on its next startup.
+
+   If you'd rather install manually, you can still drag `LanguageSwitcher.app`
+   into `Applications` yourself.
+3. Because the app is self-signed (not notarized), macOS may show a Gatekeeper
+   warning on first launch. The installer step above automatically strips the
+   quarantine flag; if you installed manually, run once:
 
    ```bash
    xattr -dr com.apple.quarantine /Applications/LanguageSwitcher.app
    ```
 
-4. Open `LanguageSwitcher.app`. If macOS still warns about the app, right-click
-   it in `Applications` and choose **Open** → **Open** once.
-5. On first launch, macOS will prompt for **Accessibility** permission. Grant
-   it in **System Settings → Privacy & Security → Accessibility**.
+4. On first launch from `/Applications`, macOS will prompt for
+   **Accessibility** permission. Grant it in **System Settings → Privacy &
+   Security → Accessibility**. The app also registers itself as a login item
+   automatically on this first launch, so it will start up every time you
+   boot the Mac. You can turn this off in Settings… → General.
 
 Optional: verify the downloaded DMG checksum before opening it:
 

@@ -10,6 +10,7 @@ final class Preferences: ObservableObject {
         static let launchAtLogin = "puntoSwitcher.launchAtLogin"
         static let hasLaunchedBefore = "puntoSwitcher.hasLaunchedBefore"
         static let seededDefaults = "puntoSwitcher.seededDefaults"
+        static let seededLaunchAtLogin = "puntoSwitcher.seededLaunchAtLogin"
         static let switchKeyboardLayout = "puntoSwitcher.switchKeyboardLayout"
     }
 
@@ -53,20 +54,31 @@ final class Preferences: ObservableObject {
     }
 
     func seedDefaultsIfNeeded() {
-        if defaults.bool(forKey: Keys.seededDefaults) { return }
-        let seeded: [String] = [
-            "com.apple.Terminal",
-            "com.googlecode.iterm2",
-            "com.apple.keychainaccess",
-            "com.1password.1password",
-            "com.1password.1password7",
-            "com.agilebits.onepassword7",
-            "com.bitwarden.desktop"
-        ]
-        var merged = Set(blacklist)
-        for id in seeded { merged.insert(id) }
-        blacklist = Array(merged).sorted()
-        defaults.set(true, forKey: Keys.seededDefaults)
+        if !defaults.bool(forKey: Keys.seededDefaults) {
+            let seeded: [String] = [
+                "com.apple.Terminal",
+                "com.googlecode.iterm2",
+                "com.apple.keychainaccess",
+                "com.1password.1password",
+                "com.1password.1password7",
+                "com.agilebits.onepassword7",
+                "com.bitwarden.desktop"
+            ]
+            var merged = Set(blacklist)
+            for id in seeded { merged.insert(id) }
+            blacklist = Array(merged).sorted()
+            defaults.set(true, forKey: Keys.seededDefaults)
+        }
+
+        // Enable launch-at-login once, the first time the app runs from a
+        // stable location (i.e. /Applications). Registering from /Volumes/…
+        // would point the login item at a DMG that eventually gets ejected,
+        // so we wait until the user installs the app properly.
+        if !defaults.bool(forKey: Keys.seededLaunchAtLogin),
+           Installer.isInstalledInApplications {
+            launchAtLogin = true
+            defaults.set(true, forKey: Keys.seededLaunchAtLogin)
+        }
     }
 
     func addBlacklistedApp(_ bundleId: String) {

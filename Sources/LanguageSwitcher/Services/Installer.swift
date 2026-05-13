@@ -36,28 +36,34 @@ enum Installer {
     private static func offerInstallFromDMG(bundlePath: String) {
         let appURL = URL(fileURLWithPath: bundlePath)
         let destURL = URL(fileURLWithPath: "/Applications/\(appURL.lastPathComponent)")
+        let isUpdate = FileManager.default.fileExists(atPath: destURL.path)
 
         let alert = NSAlert()
-        alert.messageText = "Move LanguageSwitcher to Applications?"
-        alert.informativeText = """
+        alert.messageText = isUpdate ? "Update LanguageSwitcher in Applications?" : "Move LanguageSwitcher to Applications?"
+        alert.informativeText = isUpdate ? """
+            A copy of LanguageSwitcher already exists in /Applications. Click Update \
+            to quit the installed copy, replace it with this version, relaunch it, \
+            eject the DMG, and remove the .dmg file from your Downloads folder.
+            """ : """
             The app is running from a disk image. Click Install to copy it to \
             /Applications, eject the DMG, and remove the .dmg file from your \
             Downloads folder.
             """
-        alert.addButton(withTitle: "Install")
+        alert.addButton(withTitle: isUpdate ? "Update" : "Install")
         alert.addButton(withTitle: "Not Now")
         let choice = alert.runModal()
         guard choice == .alertFirstButtonReturn else { return }
 
         let fm = FileManager.default
         do {
-            if fm.fileExists(atPath: destURL.path) {
+            if isUpdate {
+                quitRunningInstalledCopy(at: destURL)
                 try fm.removeItem(at: destURL)
             }
             try fm.copyItem(at: appURL, to: destURL)
         } catch {
             let fail = NSAlert()
-            fail.messageText = "Couldn't install to /Applications"
+            fail.messageText = isUpdate ? "Couldn't update /Applications copy" : "Couldn't install to /Applications"
             fail.informativeText = error.localizedDescription
             fail.alertStyle = .warning
             fail.runModal()
@@ -124,6 +130,34 @@ enum Installer {
     }
 
     // MARK: - Utilities
+
+    @MainActor
+    private static func quitRunningInstalledCopy(at appURL: URL) {
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return }
+
+        let targetURL = appURL.standardizedFileURL
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        for app in NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier) {
+            guard app.processIdentifier != currentPID,
+                  app.bundleURL?.standardizedFileURL == targetURL else { continue }
+
+            if !app.terminate() {
+                app.forceTerminate()
+            }
+            waitForTermination(of: app, timeout: 3)
+            if !app.isTerminated {
+                app.forceTerminate()
+                waitForTermination(of: app, timeout: 2)
+            }
+        }
+    }
+
+    private static func waitForTermination(of app: NSRunningApplication, timeout: TimeInterval) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !app.isTerminated && Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+    }
 
     /// Given `/Volumes/MyDisk/My.app/...`, returns `/Volumes/MyDisk`.
     private static func volumePrefix(of path: String) -> String? {

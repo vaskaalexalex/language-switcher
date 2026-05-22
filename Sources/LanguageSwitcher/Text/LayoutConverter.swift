@@ -57,7 +57,7 @@ enum LayoutConverter {
         var out = String()
         out.reserveCapacity(input.count)
         for ch in input {
-            if let mapped = table[ch] {
+            if ch.isLetter, let mapped = table[ch] {
                 out.append(mapped)
             } else {
                 out.append(ch)

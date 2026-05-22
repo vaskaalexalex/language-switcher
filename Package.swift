@@ -13,6 +13,11 @@ let package = Package(
         .executableTarget(
             name: "LanguageSwitcher",
             path: "Sources/LanguageSwitcher"
+        ),
+        .testTarget(
+            name: "LanguageSwitcherTests",
+            dependencies: ["LanguageSwitcher"],
+            path: "Tests/LanguageSwitcherTests"
         )
     ]
 )

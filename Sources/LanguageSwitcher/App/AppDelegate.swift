@@ -15,14 +15,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Installer.performPostInstallHousekeeping()
 
+        _ = UpdateService.shared
+
         Preferences.shared.seedDefaultsIfNeeded()
 
         statusItemController = StatusItemController(
             onConvert: { [weak self] in self?.performConversion() },
             onOpenSettings: { [weak self] in self?.openSettings() },
+            onCheckForUpdates: { UpdateService.shared.checkForUpdates() },
             onOpenAccessibility: { Self.openAccessibilitySettings() },
             onQuit: { NSApp.terminate(nil) },
-            isRunning: { [weak self] in self?.hotkeyMonitor != nil }
+            isRunning: { [weak self] in self?.hotkeyMonitor != nil },
+            canCheckForUpdates: { UpdateService.shared.canCheckForUpdates }
         )
         statusItemController?.install()
 

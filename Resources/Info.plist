@@ -21,9 +21,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.1.4</string>
+    <string>1.1.5</string>
     <key>CFBundleVersion</key>
-    <string>6</string>
+    <string>7</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
@@ -38,5 +38,13 @@
     <false/>
     <key>NSAppleEventsUsageDescription</key>
     <string>LanguageSwitcher needs Accessibility access to convert text layout system-wide.</string>
+    <key>SUFeedURL</key>
+    <string>https://github.com/vaskaalexalex/language-switcher/releases/latest/download/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>0dMmQ4EF/ImeCU2OIWW9iumQvrJYAScvrE7TtcepIMw=</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUScheduledCheckInterval</key>
+    <integer>86400</integer>
 </dict>
 </plist>

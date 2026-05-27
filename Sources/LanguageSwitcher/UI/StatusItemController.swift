@@ -4,24 +4,30 @@ import ApplicationServices
 final class StatusItemController: NSObject, NSMenuDelegate {
     private let onConvert: () -> Void
     private let onOpenSettings: () -> Void
+    private let onCheckForUpdates: () -> Void
     private let onOpenAccessibility: () -> Void
     private let onQuit: () -> Void
     private let isRunning: () -> Bool
+    private let canCheckForUpdates: () -> Bool
 
     private var statusItem: NSStatusItem?
 
     init(
         onConvert: @escaping () -> Void,
         onOpenSettings: @escaping () -> Void,
+        onCheckForUpdates: @escaping () -> Void,
         onOpenAccessibility: @escaping () -> Void,
         onQuit: @escaping () -> Void,
-        isRunning: @escaping () -> Bool
+        isRunning: @escaping () -> Bool,
+        canCheckForUpdates: @escaping () -> Bool
     ) {
         self.onConvert = onConvert
         self.onOpenSettings = onOpenSettings
+        self.onCheckForUpdates = onCheckForUpdates
         self.onOpenAccessibility = onOpenAccessibility
         self.onQuit = onQuit
         self.isRunning = isRunning
+        self.canCheckForUpdates = canCheckForUpdates
         super.init()
     }
 
@@ -91,6 +97,25 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         settings.target = self
         menu.addItem(settings)
 
+        let updates = NSMenuItem(
+            title: "Check for Updates…",
+            action: #selector(handleCheckForUpdates),
+            keyEquivalent: ""
+        )
+        updates.target = self
+        updates.isEnabled = canCheckForUpdates()
+        menu.addItem(updates)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let version = NSMenuItem(
+            title: "Version \(AppVersion.displayString)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        version.isEnabled = false
+        menu.addItem(version)
+
         menu.addItem(NSMenuItem.separator())
 
         let quit = NSMenuItem(
@@ -109,6 +134,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     @objc private func handleConvert() { onConvert() }
     @objc private func handleOpenSettings() { onOpenSettings() }
+    @objc private func handleCheckForUpdates() { onCheckForUpdates() }
     @objc private func handleOpenAccessibility() { onOpenAccessibility() }
     @objc private func handleQuit() { onQuit() }
 }

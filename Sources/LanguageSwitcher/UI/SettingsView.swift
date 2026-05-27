@@ -32,6 +32,16 @@ struct SettingsView: View {
                 Text("• Without a selection: converts the word to the left of the caret.")
             }
             .padding(.top, 4)
+            Divider()
+            HStack {
+                Text("Version \(AppVersion.displayString)")
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Check for Updates…") {
+                    UpdateService.shared.checkForUpdates()
+                }
+                .disabled(!UpdateService.shared.canCheckForUpdates)
+            }
         }
         .padding()
     }

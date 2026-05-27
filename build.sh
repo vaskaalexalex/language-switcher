@@ -33,6 +33,7 @@ APP_DIR="$BUILD_DIR/$APP_NAME.app"
 CONTENTS="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS/MacOS"
 RES_DIR="$CONTENTS/Resources"
+FRAMEWORKS_DIR="$CONTENTS/Frameworks"
 
 ICON_ICNS="$ROOT/Resources/AppIcon.icns"
 if [ ! -f "$ICON_ICNS" ] || [ "$ROOT/scripts/make-icon.swift" -nt "$ICON_ICNS" ]; then
@@ -41,17 +42,27 @@ if [ ! -f "$ICON_ICNS" ] || [ "$ROOT/scripts/make-icon.swift" -nt "$ICON_ICNS" ]
 fi
 
 echo "==> swift build ($CONFIG)"
+swift package resolve >/dev/null
 swift build -c "$CONFIG" --product "$APP_NAME"
 
-BIN_PATH="$(swift build -c "$CONFIG" --show-bin-path)/$APP_NAME"
+BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
+BIN_PATH="$BIN_DIR/$APP_NAME"
 
 echo "==> packaging $APP_DIR"
 rm -rf "$APP_DIR"
-mkdir -p "$MACOS_DIR" "$RES_DIR"
+mkdir -p "$MACOS_DIR" "$RES_DIR" "$FRAMEWORKS_DIR"
 
 cp "$BIN_PATH" "$MACOS_DIR/$APP_NAME"
 cp "$ROOT/Resources/Info.plist" "$CONTENTS/Info.plist"
 cp "$ICON_ICNS" "$RES_DIR/AppIcon.icns"
+
+SPARKLE_FRAMEWORK="$BIN_DIR/Sparkle.framework"
+if [ ! -d "$SPARKLE_FRAMEWORK" ]; then
+  echo "error: Sparkle.framework not found in $BIN_DIR" >&2
+  exit 1
+fi
+cp -R "$SPARKLE_FRAMEWORK" "$FRAMEWORKS_DIR/"
+install_name_tool -add_rpath "@executable_path/../Frameworks" "$MACOS_DIR/$APP_NAME" 2>/dev/null || true
 
 # Create PkgInfo
 printf 'APPL????' > "$CONTENTS/PkgInfo"
@@ -63,6 +74,10 @@ if ! security find-identity -v -p codesigning 2>/dev/null | grep -q "$SIGN_IDENT
 fi
 
 echo "==> codesigning with '$SIGN_IDENTITY'"
+codesign --force --sign "$SIGN_IDENTITY" \
+  --options runtime \
+  --timestamp=none \
+  "$FRAMEWORKS_DIR/Sparkle.framework"
 codesign --force --deep --sign "$SIGN_IDENTITY" \
   --entitlements "$ROOT/Resources/LanguageSwitcher.entitlements" \
   --options runtime \

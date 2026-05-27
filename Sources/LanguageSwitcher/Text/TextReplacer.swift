@@ -47,18 +47,20 @@ final class TextReplacer {
             Log.info("AX range loc=\(r.location) len=\(r.length)")
         }
 
-        // 2) Pre-compute the target token from AXValue + caret, if AX can read
-        //    them (works in Chrome, Electron, native text fields alike).
+        // 2) Pre-compute replacement range from AXValue + caret when there is no
+        //    explicit selection (last token before caret).
         let caretPosition = axRange.map { $0.location + $0.length }
         var axTarget: TokenTarget?
         var axFullText: String?
         if let element {
             axFullText = AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String)
-            axTarget = axFullText.flatMap { Self.computeTokenTarget(in: $0, caretHint: caretPosition) }
-                .map { TokenTarget(start: $0.start, length: $0.length, snippet: $0.snippet) }
+            if !hasSelection {
+                axTarget = axFullText.flatMap { Self.computeTokenTarget(in: $0, caretHint: caretPosition) }
+                    .map { TokenTarget(start: $0.start, length: $0.length, snippet: $0.snippet) }
+            }
         }
         if let t = axTarget {
-            Log.info("AX target: range=(\(t.start),\(t.length)) snippet=\(t.snippet.debugDescription)")
+            Log.info("AX token target: range=(\(t.start),\(t.length)) snippet=\(t.snippet.debugDescription)")
         }
 
         // 3) Resolve text to convert.
@@ -121,14 +123,26 @@ final class TextReplacer {
         let converted = LayoutConverter.convert(selected)
         Log.info("Converting: \(selected.debugDescription) -> \(converted.debugDescription)")
 
+        var replacementTarget: TokenTarget?
+        if hasSelection, let r = axRange, r.length > 0 {
+            replacementTarget = Self.selectionTokenTarget(
+                in: axFullText, range: r, fallbackSnippet: selected)
+                .map { TokenTarget(start: $0.start, length: $0.length, snippet: $0.snippet) }
+            if let t = replacementTarget {
+                Log.info("AX selection target: range=(\(t.start),\(t.length)) snippet=\(t.snippet.debugDescription)")
+            }
+        } else {
+            replacementTarget = axTarget
+        }
+
         var replaced = false
-        if let element, let t = axTarget, let full = axFullText {
+        if let element, let t = replacementTarget, let full = axFullText {
             replaced = await tryAXValueReplacement(
                 element: element, fullText: full, target: t, converted: converted)
         }
 
         if !replaced, let element {
-            if axSelectedText(element).isEmpty, let t = axTarget {
+            if axSelectedText(element).isEmpty, let t = replacementTarget {
                 Log.info("Ensuring selection before AX/paste replacement")
                 _ = await selectExactTokenViaSynth(length: t.length)
             }
@@ -136,7 +150,7 @@ final class TextReplacer {
         }
 
         if !replaced {
-            if let t = axTarget, axSelectedText(element).isEmpty {
+            if let t = replacementTarget, axSelectedText(element).isEmpty {
                 _ = await selectExactTokenViaSynth(length: t.length)
             }
             await pasteReplacement(converted)
@@ -173,6 +187,22 @@ final class TextReplacer {
         let ns = text as NSString
         guard start >= 0, length > 0, start + length <= ns.length else { return nil }
         return ns.substring(with: NSRange(location: start, length: length))
+    }
+
+    /// Explicit AX selection range — not the last-token heuristic.
+    static func selectionTokenTarget(
+        in text: String?,
+        range: CFRange,
+        fallbackSnippet: String
+    ) -> (start: Int, length: Int, snippet: String)? {
+        guard range.location >= 0, range.length > 0 else { return nil }
+        let selectedSnippet: String
+        if let text, let slice = Self.snippet(from: text, start: range.location, length: range.length) {
+            selectedSnippet = slice
+        } else {
+            selectedSnippet = fallbackSnippet
+        }
+        return (start: range.location, length: range.length, snippet: selectedSnippet)
     }
 
     static func replaceToken(in text: String, start: Int, length: Int, replacement: String) -> String {

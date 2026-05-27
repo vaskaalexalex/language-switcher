@@ -44,6 +44,17 @@ struct TokenTargetTests {
         expectToken(TextReplacer.computeTokenTarget(in: "(hello)", caretHint: 7), 0, 7, "(hello)")
     }
 
+    @Test
+    func testGitPrefixWithEmptyWordReturnsNil() {
+        #expect(TextReplacer.computeTokenTarget(in: "main: ", caretHint: 6) == nil)
+    }
+
+    @Test
+    func testGitPrefixWithWordAtEnd() {
+        expectToken(TextReplacer.computeTokenTarget(in: "main: убрал", caretHint: 11), 6, 5, "убрал")
+        expectToken(TextReplacer.computeTokenTarget(in: "main: e,рал", caretHint: 11), 6, 5, "e,рал")
+    }
+
     private func expectToken(
         _ actual: (start: Int, length: Int, snippet: String)?,
         _ start: Int,

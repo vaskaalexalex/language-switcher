@@ -23,6 +23,7 @@ final class TextReplacer {
 
     @MainActor
     private func run() async {
+        let started = CACurrentMediaTime()
         let frontmost = NSWorkspace.shared.frontmostApplication
         Log.info("Trigger fired (frontmost=\(frontmost?.bundleIdentifier ?? "nil"))")
 
@@ -48,7 +49,8 @@ final class TextReplacer {
 
         // 2) Pre-compute the target token from AXValue + caret, if AX can read
         //    them (works in Chrome, Electron, native text fields alike).
-        let target = element.flatMap { computeLastTokenTarget(in: $0, caretHint: axRange?.location) }
+        let caretPosition = axRange.map { $0.location + $0.length }
+        let target = element.flatMap { computeLastTokenTarget(in: $0, caretHint: caretPosition) }
         if let t = target {
             Log.info("AX target: range=(\(t.start),\(t.length)) snippet=\(t.snippet.debugDescription)")
         }
@@ -56,43 +58,33 @@ final class TextReplacer {
         // 3) If there is no existing selection, select the last token.
         var selected = ""
         if hasSelection {
-            // User already has a selection — just read it.
             selected = axSelectedText(element)
             if selected.isEmpty { selected = await clipboardRead() }
         } else if let t = target, let element {
-            // Fast AX write. Works in native text fields.
             let newRange = CFRange(location: t.start, length: t.length)
             let axSet = AccessibilityBridge.setRangeAttribute(
                 element, kAXSelectedTextRangeAttribute as String, newRange)
             Log.info("AX set range=\(axSet)")
 
             if axSet {
-                // Short verify. If AX reports the selection is really there we're done.
-                try? await Task.sleep(nanoseconds: 25_000_000)
-                let verify = axSelectedText(element)
-                if !verify.isEmpty && verify.count == t.length {
-                    selected = verify
-                    Log.info("AX write verified (\(verify.count) chars)")
+                let verified = await waitUntil(pollNanoseconds: 5_000_000, maxAttempts: 6) {
+                    let verify = self.axSelectedText(element)
+                    return !verify.isEmpty && verify.count == t.length
+                }
+                if verified {
+                    selected = axSelectedText(element)
+                    Log.info("AX write verified (\(selected.count) chars)")
                 }
             }
 
-            // AX lied or refused (Chrome/Electron). Use the keyboard but we
-            // already know how many characters we need, so it's one ⌥⇧← plus
-            // a burst of ⇧← — no per-character clipboard polling. We also
-            // verify that the AX snippet actually matches reality (Chrome
-            // sometimes exposes placeholder text instead of the real value).
             if selected.isEmpty {
                 Log.info("AX write ineffective, using synth with target=\(t.snippet.debugDescription)")
                 selected = await selectTokenViaSynth(target: t)
             }
         } else {
-            // No AX data at all. Fall back to the slow, universal path:
-            // ⌥⇧← then grow char-by-char until whitespace.
             Log.info("No AX data, using synth + char-grow")
             KeyboardSynth.selectPreviousWord()
-            try? await Task.sleep(nanoseconds: 60_000_000)
-            selected = axSelectedText(element)
-            if selected.isEmpty { selected = await clipboardRead() }
+            selected = await waitForSelection(element: element, viaClipboard: true, maxAttempts: 5, pollNanoseconds: 8_000_000)
             if !selected.isEmpty {
                 let grown = await growSelectionLeftToWhitespace(initial: selected)
                 if grown != selected {
@@ -111,11 +103,23 @@ final class TextReplacer {
         let converted = LayoutConverter.convert(selected)
         Log.info("Converting: \(selected.debugDescription) -> \(converted.debugDescription)")
 
-        await pasteReplacement(converted)
+        let replaced: Bool
+        if let element {
+            replaced = await tryAXReplacement(element: element, converted: converted)
+        } else {
+            replaced = false
+        }
+
+        if !replaced {
+            await pasteReplacement(converted)
+        }
 
         if Preferences.shared.switchKeyboardLayout {
             InputSource.switchToMatch(converted)
         }
+
+        let elapsed = (CACurrentMediaTime() - started) * 1000
+        Log.info(String(format: "Conversion finished in %.0f ms", elapsed))
     }
 
     // MARK: - Target computation
@@ -154,7 +158,12 @@ final class TextReplacer {
         }
         guard effectiveEnd > 0 else { return nil }
 
-        var caret = caretHint ?? effectiveEnd
+        let rawCaret = caretHint ?? effectiveEnd
+        if rawCaret > effectiveEnd {
+            return tokenBeforeTrailingWhitespace(in: ns, rawCaret: rawCaret, effectiveEnd: effectiveEnd, whitespace: whitespace)
+        }
+
+        var caret = rawCaret
         if caret <= 0 || caret > ns.length { caret = effectiveEnd }
         if caret > effectiveEnd { caret = effectiveEnd }
 
@@ -176,6 +185,43 @@ final class TextReplacer {
         return (start: start, length: length, snippet: snippet)
     }
 
+    /// Caret sits in trailing whitespace after the last non-whitespace character.
+    /// Select the previous word only when it ends with a letter or digit; otherwise
+    /// there is nothing to convert (e.g. cursor after `main: `).
+    private static func tokenBeforeTrailingWhitespace(
+        in ns: NSString,
+        rawCaret: Int,
+        effectiveEnd: Int,
+        whitespace: CharacterSet
+    ) -> (start: Int, length: Int, snippet: String)? {
+        var wsStart = min(rawCaret, ns.length)
+        while wsStart > effectiveEnd {
+            let prev = ns.substring(with: NSRange(location: wsStart - 1, length: 1))
+            if let scalar = prev.unicodeScalars.first, whitespace.contains(scalar) {
+                wsStart -= 1
+            } else {
+                break
+            }
+        }
+
+        guard wsStart == effectiveEnd, effectiveEnd > 0 else { return nil }
+
+        let lastChar = ns.substring(with: NSRange(location: effectiveEnd - 1, length: 1))
+        guard endsWithLetterOrDigit(lastChar) else { return nil }
+
+        let start = scanBackToWhitespace(in: ns, from: effectiveEnd, whitespace: whitespace)
+        let length = effectiveEnd - start
+        guard length > 0 else { return nil }
+
+        let snippet = ns.substring(with: NSRange(location: start, length: length))
+        return (start: start, length: length, snippet: snippet)
+    }
+
+    private static func endsWithLetterOrDigit(_ ch: String) -> Bool {
+        guard let scalar = ch.unicodeScalars.first else { return false }
+        return CharacterSet.alphanumerics.contains(scalar)
+    }
+
     private static func scanBackToWhitespace(in ns: NSString, from caret: Int, whitespace: CharacterSet) -> Int {
         var start = caret
         while start > 0 {
@@ -186,13 +232,70 @@ final class TextReplacer {
         return start
     }
 
+    // MARK: - AX direct replacement
+
+    @MainActor
+    private func tryAXReplacement(element: AXUIElement, converted: String) async -> Bool {
+        guard AccessibilityBridge.setStringAttribute(
+            element, kAXSelectedTextAttribute as String, converted
+        ) else {
+            Log.info("AX direct write failed")
+            return false
+        }
+
+        let ok = await waitUntil(pollNanoseconds: 5_000_000, maxAttempts: 8) {
+            let sel = self.axSelectedText(element)
+            return sel.isEmpty || sel == converted
+        }
+        Log.info("AX direct write \(ok ? "verified" : "unverified")")
+        return ok
+    }
+
+    // MARK: - Adaptive waits
+
+    @MainActor
+    private func waitUntil(
+        pollNanoseconds: UInt64 = 5_000_000,
+        maxAttempts: Int = 20,
+        condition: () -> Bool
+    ) async -> Bool {
+        if condition() { return true }
+        for _ in 0..<maxAttempts {
+            try? await Task.sleep(nanoseconds: pollNanoseconds)
+            if condition() { return true }
+        }
+        return false
+    }
+
+    @MainActor
+    private func waitForSelection(
+        element: AXUIElement?,
+        viaClipboard: Bool,
+        maxAttempts: Int,
+        pollNanoseconds: UInt64
+    ) async -> String {
+        for _ in 0..<maxAttempts {
+            let axText = axSelectedText(element)
+            if !axText.isEmpty { return axText }
+            if viaClipboard {
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                let baseline = pb.changeCount
+                KeyboardSynth.copy()
+                try? await Task.sleep(nanoseconds: pollNanoseconds)
+                if pb.changeCount != baseline,
+                   let s = pb.string(forType: .string), !s.isEmpty {
+                    return s
+                }
+            } else {
+                try? await Task.sleep(nanoseconds: pollNanoseconds)
+            }
+        }
+        return ""
+    }
+
     // MARK: - Known-length synthetic selection (fast)
 
-    /// Synthesizes ⌥⇧← (select prev word) then bursts ⇧← until the selection
-    /// covers exactly `target.length` characters from the caret. Before the
-    /// burst we sanity-check the AX snippet against the actual selection —
-    /// if Chrome fed us a placeholder instead of the real value, the snippet
-    /// won't match and we fall back to char-by-char grow.
     @MainActor
     private func selectTokenViaSynth(target: TokenTarget) async -> String {
         let pb = NSPasteboard.general
@@ -200,15 +303,9 @@ final class TextReplacer {
         defer { restorePasteboard(pb, items: saved) }
 
         KeyboardSynth.selectPreviousWord()
-        try? await Task.sleep(nanoseconds: 60_000_000)
-
-        let current = await copySelection(pb)
+        let current = await waitForSelection(element: nil, viaClipboard: true, maxAttempts: 5, pollNanoseconds: 8_000_000)
         Log.info("synth initial selection len=\(current.count) value=\(current.debugDescription), target len=\(target.length)")
 
-        // Sanity check: the initial word-left selection must be a suffix of
-        // the AX snippet — otherwise AX reported a placeholder / stale value
-        // and the target length is meaningless. Fall back to char-grow in
-        // that case.
         let axTrustworthy = !current.isEmpty && target.snippet.hasSuffix(current)
         if !axTrustworthy {
             Log.info("AX snippet untrustworthy (suffix mismatch); falling back to char-grow")
@@ -217,25 +314,22 @@ final class TextReplacer {
 
         if current.count >= target.length { return current }
 
-        // Burst ⇧← — no clipboard polling between presses.
         let need = target.length - current.count
         for _ in 0..<need {
             KeyboardSynth.extendSelectionLeftChar()
         }
 
-        try? await Task.sleep(nanoseconds: 40_000_000)
-        let final = await copySelection(pb)
+        let final = await waitForSelection(element: nil, viaClipboard: true, maxAttempts: 5, pollNanoseconds: 8_000_000)
         return final.isEmpty ? current : final
     }
 
-    /// Synthesize ⌘C and poll the pasteboard for the selected text.
     @MainActor
     private func copySelection(_ pb: NSPasteboard) async -> String {
         pb.clearContents()
         let baseline = pb.changeCount
         KeyboardSynth.copy()
         for _ in 0..<25 {
-            try? await Task.sleep(nanoseconds: 15_000_000)
+            try? await Task.sleep(nanoseconds: 8_000_000)
             if pb.changeCount != baseline,
                let s = pb.string(forType: .string) {
                 return s
@@ -246,13 +340,6 @@ final class TextReplacer {
 
     // MARK: - Char-by-char selection grow (universal fallback)
 
-    /// After system ⌥⇧← selects the last "word" (stopping at punctuation), this
-    /// extends the selection leftward one character at a time using ⇧←, and
-    /// stops when the newly added character is whitespace/newline. Rolls back
-    /// one step in that case so whitespace isn't included.
-    ///
-    /// Works even in apps where AX can't read field contents, because we infer
-    /// the added character by diffing the clipboard contents after each step.
     @MainActor
     private func growSelectionLeftToWhitespace(initial: String) async -> String {
         let pb = NSPasteboard.general
@@ -262,9 +349,9 @@ final class TextReplacer {
         var current = initial
         let whitespace = CharacterSet.whitespacesAndNewlines
 
-        for _ in 0..<200 { // safety cap
+        for _ in 0..<200 {
             KeyboardSynth.extendSelectionLeftChar()
-            try? await Task.sleep(nanoseconds: 15_000_000)
+            try? await Task.sleep(nanoseconds: 8_000_000)
 
             pb.clearContents()
             let baseline = pb.changeCount
@@ -272,7 +359,7 @@ final class TextReplacer {
 
             var extended: String? = nil
             for _ in 0..<15 {
-                try? await Task.sleep(nanoseconds: 15_000_000)
+                try? await Task.sleep(nanoseconds: 8_000_000)
                 if pb.changeCount != baseline,
                    let s = pb.string(forType: .string) {
                     extended = s
@@ -280,20 +367,14 @@ final class TextReplacer {
                 }
             }
 
-            guard let new = extended, !new.isEmpty else {
-                // Copy didn't produce anything; treat as end-of-field.
-                break
-            }
-            if new.count <= current.count {
-                // Couldn't extend further — already at start of field.
-                break
-            }
+            guard let new = extended, !new.isEmpty else { break }
+            if new.count <= current.count { break }
+
             let addedCount = new.count - current.count
             let addedPrefix = String(new.prefix(addedCount))
-            // If any added scalar is whitespace, we overshot: roll back once.
             if addedPrefix.unicodeScalars.contains(where: { whitespace.contains($0) }) {
                 KeyboardSynth.shrinkSelectionRightChar()
-                try? await Task.sleep(nanoseconds: 10_000_000)
+                try? await Task.sleep(nanoseconds: 8_000_000)
                 break
             }
             current = new
@@ -310,7 +391,6 @@ final class TextReplacer {
 
     // MARK: - Clipboard read (used when AX can't see the selection)
 
-    /// Save clipboard, synth ⌘C, read resulting string, restore clipboard.
     @MainActor
     private func clipboardRead() async -> String {
         let pb = NSPasteboard.general
@@ -320,10 +400,9 @@ final class TextReplacer {
         let baseline = pb.changeCount
         KeyboardSynth.copy()
 
-        // Poll for up to ~400 ms for ⌘C to land.
         var result = ""
         for _ in 0..<20 {
-            try? await Task.sleep(nanoseconds: 20_000_000) // 20ms
+            try? await Task.sleep(nanoseconds: 8_000_000)
             if pb.changeCount != baseline,
                let s = pb.string(forType: .string), !s.isEmpty {
                 result = s
@@ -345,11 +424,10 @@ final class TextReplacer {
         pb.clearContents()
         pb.setString(text, forType: .string)
 
-        try? await Task.sleep(nanoseconds: 25_000_000) // 25ms
         KeyboardSynth.paste()
 
-        // Give the paste time to land before we clobber the pasteboard back.
-        try? await Task.sleep(nanoseconds: 300_000_000) // 300ms
+        // Brief pause for paste to land, then restore clipboard.
+        try? await Task.sleep(nanoseconds: 15_000_000)
         restorePasteboard(pb, items: saved)
     }
 

@@ -22,10 +22,20 @@ struct LayoutConverterTests {
     }
 
     @Test
-    func testPunctuationAndDigitsStayInPlaceForEnglishInput() {
-        #expect(LayoutConverter.convert("What.") == "Црфе.")
-        #expect(LayoutConverter.convert("hello, world!") == "руддщ, цщкдв!")
+    func testLayoutPunctuationConvertsForEnglishInput() {
+        #expect(LayoutConverter.convert("What.") == "Црфею")
+        #expect(LayoutConverter.convert("hello, world!") == "руддщб цщкдв!")
         #expect(LayoutConverter.convert("Test123") == "Еуые123")
+    }
+
+    @Test
+    func testWrongLayoutWordWithComma() {
+        #expect(LayoutConverter.convert("e,hfk") == "убрал")
+    }
+
+    @Test
+    func testMixedScriptWordKeepsCorrectCyrillic() {
+        #expect(LayoutConverter.convert("e,рал") == "убрал")
     }
 
     @Test

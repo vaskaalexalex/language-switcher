@@ -24,7 +24,7 @@ enum KeyboardSynth {
 
         down.post(tap: .cghidEventTap)
         // Small gap so the app processes the keydown before the keyup.
-        usleep(1_500)
+        usleep(1_000)
         up.post(tap: .cghidEventTap)
     }
 

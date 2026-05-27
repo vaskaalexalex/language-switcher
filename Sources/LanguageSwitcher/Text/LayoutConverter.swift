@@ -16,9 +16,6 @@ enum LayoutConverter {
         var dict: [Character: Character] = [:]
         for (en, ru) in enToRuPairs {
             dict[en] = ru
-            // Only add an uppercase mapping if the EN side actually has a
-            // distinct uppercase. Otherwise we'd overwrite punctuation entries
-            // (e.g. "," would be replaced by an uppercased-Russian version).
             let upEn = Character(String(en).uppercased())
             if upEn != en {
                 let upRu = Character(String(ru).uppercased())
@@ -50,14 +47,57 @@ enum LayoutConverter {
         return false
     }
 
+    private static func isLatin(_ ch: Character) -> Bool {
+        guard ch.isLetter else { return false }
+        return !isCyrillic(ch)
+    }
+
+    private static func isLayoutMappable(_ ch: Character, in table: [Character: Character]) -> Bool {
+        table[ch] != nil
+    }
+
     static func convert(_ input: String) -> String {
         if input.isEmpty { return input }
+
+        let hasLatin = input.contains(where: isLatin)
         let hasCyrillic = input.contains(where: isCyrillic)
-        let table = hasCyrillic ? ruToEn : enToRu
+
+        if hasLatin && hasCyrillic {
+            return convertMixed(input)
+        }
+        if hasCyrillic {
+            return convertWithTable(input, table: ruToEn, convertPunctuation: false)
+        }
+        return convertWithTable(input, table: enToRu, convertPunctuation: true)
+    }
+
+    /// Mixed-script token: Latin + layout punctuation → RU; Cyrillic → keep.
+    private static func convertMixed(_ input: String) -> String {
+        var out = String()
+        out.reserveCapacity(input.count)
+        for ch in input {
+            if isLatin(ch), let mapped = enToRu[ch] {
+                out.append(mapped)
+            } else if isLayoutMappable(ch, in: enToRu), let mapped = enToRu[ch] {
+                out.append(mapped)
+            } else {
+                out.append(ch)
+            }
+        }
+        return out
+    }
+
+    private static func convertWithTable(
+        _ input: String,
+        table: [Character: Character],
+        convertPunctuation: Bool
+    ) -> String {
         var out = String()
         out.reserveCapacity(input.count)
         for ch in input {
             if ch.isLetter, let mapped = table[ch] {
+                out.append(mapped)
+            } else if convertPunctuation, isLayoutMappable(ch, in: table), let mapped = table[ch] {
                 out.append(mapped)
             } else {
                 out.append(ch)

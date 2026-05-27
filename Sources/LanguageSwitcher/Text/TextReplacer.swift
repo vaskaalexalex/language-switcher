@@ -50,36 +50,54 @@ final class TextReplacer {
         // 2) Pre-compute the target token from AXValue + caret, if AX can read
         //    them (works in Chrome, Electron, native text fields alike).
         let caretPosition = axRange.map { $0.location + $0.length }
-        let target = element.flatMap { computeLastTokenTarget(in: $0, caretHint: caretPosition) }
-        if let t = target {
+        var axTarget: TokenTarget?
+        var axFullText: String?
+        if let element {
+            axFullText = AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String)
+            axTarget = axFullText.flatMap { Self.computeTokenTarget(in: $0, caretHint: caretPosition) }
+                .map { TokenTarget(start: $0.start, length: $0.length, snippet: $0.snippet) }
+        }
+        if let t = axTarget {
             Log.info("AX target: range=(\(t.start),\(t.length)) snippet=\(t.snippet.debugDescription)")
         }
 
-        // 3) If there is no existing selection, select the last token.
+        // 3) Resolve text to convert.
         var selected = ""
         if hasSelection {
             selected = axSelectedText(element)
             if selected.isEmpty { selected = await clipboardRead() }
-        } else if let t = target, let element {
-            let newRange = CFRange(location: t.start, length: t.length)
-            let axSet = AccessibilityBridge.setRangeAttribute(
-                element, kAXSelectedTextRangeAttribute as String, newRange)
-            Log.info("AX set range=\(axSet)")
+        } else if let t = axTarget, let element {
+            // Electron/Cursor: read the token straight from AXValue — no word-select needed.
+            if let full = axFullText, let snippet = Self.snippet(from: full, start: t.start, length: t.length) {
+                selected = snippet
+                Log.info("Using AX value slice (\(snippet.count) chars)")
+            }
 
-            if axSet {
-                let verified = await waitUntil(pollNanoseconds: 5_000_000, maxAttempts: 6) {
-                    let verify = self.axSelectedText(element)
-                    return !verify.isEmpty && verify.count == t.length
-                }
-                if verified {
-                    selected = axSelectedText(element)
-                    Log.info("AX write verified (\(selected.count) chars)")
+            if selected.isEmpty {
+                let newRange = CFRange(location: t.start, length: t.length)
+                let axSet = AccessibilityBridge.setRangeAttribute(
+                    element, kAXSelectedTextRangeAttribute as String, newRange)
+                Log.info("AX set range=\(axSet)")
+
+                if axSet {
+                    let verified = await waitUntil(pollNanoseconds: 5_000_000, maxAttempts: 6) {
+                        let verify = self.axSelectedText(element)
+                        return !verify.isEmpty && verify.count == t.length
+                    }
+                    if verified {
+                        selected = axSelectedText(element)
+                        Log.info("AX selection verified (\(selected.count) chars)")
+                    }
                 }
             }
 
             if selected.isEmpty {
-                Log.info("AX write ineffective, using synth with target=\(t.snippet.debugDescription)")
-                selected = await selectTokenViaSynth(target: t)
+                Log.info("Selecting exact token length via synth (\(t.length) chars)")
+                selected = await selectExactTokenViaSynth(length: t.length)
+                if selected.isEmpty {
+                    selected = t.snippet
+                    Log.info("Synth select empty; falling back to AX target snippet")
+                }
             }
         } else {
             Log.info("No AX data, using synth + char-grow")
@@ -103,14 +121,24 @@ final class TextReplacer {
         let converted = LayoutConverter.convert(selected)
         Log.info("Converting: \(selected.debugDescription) -> \(converted.debugDescription)")
 
-        let replaced: Bool
-        if let element {
+        var replaced = false
+        if let element, let t = axTarget, let full = axFullText {
+            replaced = await tryAXValueReplacement(
+                element: element, fullText: full, target: t, converted: converted)
+        }
+
+        if !replaced, let element {
+            if axSelectedText(element).isEmpty, let t = axTarget {
+                Log.info("Ensuring selection before AX/paste replacement")
+                _ = await selectExactTokenViaSynth(length: t.length)
+            }
             replaced = await tryAXReplacement(element: element, converted: converted)
-        } else {
-            replaced = false
         }
 
         if !replaced {
+            if let t = axTarget, axSelectedText(element).isEmpty {
+                _ = await selectExactTokenViaSynth(length: t.length)
+            }
             await pasteReplacement(converted)
         }
 
@@ -139,6 +167,18 @@ final class TextReplacer {
         }
         guard let target = Self.computeTokenTarget(in: fullText, caretHint: caretHint) else { return nil }
         return TokenTarget(start: target.start, length: target.length, snippet: target.snippet)
+    }
+
+    static func snippet(from text: String, start: Int, length: Int) -> String? {
+        let ns = text as NSString
+        guard start >= 0, length > 0, start + length <= ns.length else { return nil }
+        return ns.substring(with: NSRange(location: start, length: length))
+    }
+
+    static func replaceToken(in text: String, start: Int, length: Int, replacement: String) -> String {
+        let ns = text as NSString
+        guard start >= 0, length >= 0, start + length <= ns.length else { return text }
+        return ns.replacingCharacters(in: NSRange(location: start, length: length), with: replacement)
     }
 
     static func computeTokenTarget(in text: String, caretHint: Int?) -> (start: Int, length: Int, snippet: String)? {
@@ -235,6 +275,38 @@ final class TextReplacer {
     // MARK: - AX direct replacement
 
     @MainActor
+    private func tryAXValueReplacement(
+        element: AXUIElement,
+        fullText: String,
+        target: TokenTarget,
+        converted: String
+    ) async -> Bool {
+        let expected = Self.replaceToken(
+            in: fullText, start: target.start, length: target.length, replacement: converted)
+
+        guard AccessibilityBridge.setStringAttribute(
+            element, kAXValueAttribute as String, expected
+        ) else {
+            Log.info("AX value write failed")
+            return false
+        }
+
+        let newCaret = target.start + (converted as NSString).length
+        _ = AccessibilityBridge.setRangeAttribute(
+            element, kAXSelectedTextRangeAttribute as String,
+            CFRange(location: newCaret, length: 0))
+
+        let ok = await waitUntil(pollNanoseconds: 5_000_000, maxAttempts: 10) {
+            guard let current = AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String) else {
+                return false
+            }
+            return current == expected
+        }
+        Log.info("AX value write \(ok ? "verified" : "unverified")")
+        return ok
+    }
+
+    @MainActor
     private func tryAXReplacement(element: AXUIElement, converted: String) async -> Bool {
         guard AccessibilityBridge.setStringAttribute(
             element, kAXSelectedTextAttribute as String, converted
@@ -294,33 +366,24 @@ final class TextReplacer {
         return ""
     }
 
-    // MARK: - Known-length synthetic selection (fast)
+    // MARK: - Exact-length synthetic selection
 
+    /// Select exactly `length` characters left of the caret using ⇧← bursts.
+    /// Avoids ⌥⇧← word boundaries that split tokens like `e,рал` in Electron.
     @MainActor
-    private func selectTokenViaSynth(target: TokenTarget) async -> String {
+    private func selectExactTokenViaSynth(length: Int) async -> String {
+        guard length > 0 else { return "" }
+
         let pb = NSPasteboard.general
         let saved = savePasteboard(pb)
         defer { restorePasteboard(pb, items: saved) }
 
-        KeyboardSynth.selectPreviousWord()
-        let current = await waitForSelection(element: nil, viaClipboard: true, maxAttempts: 5, pollNanoseconds: 8_000_000)
-        Log.info("synth initial selection len=\(current.count) value=\(current.debugDescription), target len=\(target.length)")
-
-        let axTrustworthy = !current.isEmpty && target.snippet.hasSuffix(current)
-        if !axTrustworthy {
-            Log.info("AX snippet untrustworthy (suffix mismatch); falling back to char-grow")
-            return await growSelectionLeftToWhitespace(initial: current)
-        }
-
-        if current.count >= target.length { return current }
-
-        let need = target.length - current.count
-        for _ in 0..<need {
+        for _ in 0..<length {
             KeyboardSynth.extendSelectionLeftChar()
         }
 
-        let final = await waitForSelection(element: nil, viaClipboard: true, maxAttempts: 5, pollNanoseconds: 8_000_000)
-        return final.isEmpty ? current : final
+        return await waitForSelection(
+            element: nil, viaClipboard: true, maxAttempts: 8, pollNanoseconds: 8_000_000)
     }
 
     @MainActor

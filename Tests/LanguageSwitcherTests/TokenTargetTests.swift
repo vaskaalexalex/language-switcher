@@ -55,6 +55,12 @@ struct TokenTargetTests {
         expectToken(TextReplacer.computeTokenTarget(in: "main: e,рал", caretHint: 11), 6, 5, "e,рал")
     }
 
+    @Test
+    func testStaleAXValueCaretBeyondTextFallsBackToLastToken() {
+        // Cursor file-chip: AXValue lags (shows "k") while caret is far ahead.
+        expectToken(TextReplacer.computeTokenTarget(in: "k", caretHint: 221), 0, 1, "k")
+    }
+
     private func expectToken(
         _ actual: (start: Int, length: Int, snippet: String)?,
         _ start: Int,

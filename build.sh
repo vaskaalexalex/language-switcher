@@ -9,6 +9,10 @@
 #   ./build.sh install         # build + copy to /Applications
 #   ./build.sh dmg             # release build + package DMG into ./dist/
 #
+# Signing:
+#   Default: self-signed "LanguageSwitcher Local Dev" (stable DR for TCC).
+#   Release: SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./build.sh dmg
+#
 set -euo pipefail
 
 CONFIG="${1:-release}"
@@ -34,6 +38,7 @@ CONTENTS="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS/MacOS"
 RES_DIR="$CONTENTS/Resources"
 FRAMEWORKS_DIR="$CONTENTS/Frameworks"
+LOCAL_DEV_IDENTITY="LanguageSwitcher Local Dev"
 
 ICON_ICNS="$ROOT/Resources/AppIcon.icns"
 if [ ! -f "$ICON_ICNS" ] || [ "$ROOT/scripts/make-icon.swift" -nt "$ICON_ICNS" ]; then
@@ -67,27 +72,49 @@ install_name_tool -add_rpath "@executable_path/../Frameworks" "$MACOS_DIR/$APP_N
 # Create PkgInfo
 printf 'APPL????' > "$CONTENTS/PkgInfo"
 
-SIGN_IDENTITY="${SIGN_IDENTITY:-LanguageSwitcher Local Dev}"
-if ! security find-identity -v -p codesigning 2>/dev/null | grep -q "$SIGN_IDENTITY"; then
+SIGN_IDENTITY="${SIGN_IDENTITY:-$LOCAL_DEV_IDENTITY}"
+IS_DEVELOPER_ID=false
+if [[ "$SIGN_IDENTITY" == Developer\ ID* ]]; then
+  IS_DEVELOPER_ID=true
+fi
+
+if ! security find-identity -v -p codesigning 2>/dev/null | grep -Fq "$SIGN_IDENTITY"; then
+  if [ "$IS_DEVELOPER_ID" = true ]; then
+    echo "error: Developer ID identity '$SIGN_IDENTITY' not found in keychain." >&2
+    exit 1
+  fi
   echo "==> '$SIGN_IDENTITY' not found; running scripts/setup-signing.sh"
   "$ROOT/scripts/setup-signing.sh"
 fi
 
-echo "==> codesigning with '$SIGN_IDENTITY'"
+if [ "$IS_DEVELOPER_ID" = true ]; then
+  ENTITLEMENTS="$ROOT/Resources/LanguageSwitcher.entitlements"
+  TIMESTAMP_FLAG="--timestamp"
+  export SIGN_MODE="developer-id"
+else
+  ENTITLEMENTS="$ROOT/Resources/LanguageSwitcher.local-dev.entitlements"
+  TIMESTAMP_FLAG="--timestamp=none"
+  export SIGN_MODE="local-dev"
+fi
+
+echo "==> codesigning with '$SIGN_IDENTITY' (mode: $SIGN_MODE)"
 codesign --force --sign "$SIGN_IDENTITY" \
   --options runtime \
-  --timestamp=none \
+  $TIMESTAMP_FLAG \
   "$FRAMEWORKS_DIR/Sparkle.framework"
 codesign --force --deep --sign "$SIGN_IDENTITY" \
-  --entitlements "$ROOT/Resources/LanguageSwitcher.entitlements" \
+  --entitlements "$ENTITLEMENTS" \
   --options runtime \
-  --timestamp=none \
+  $TIMESTAMP_FLAG \
   "$APP_DIR"
 
 # Signing with a stable self-signed identity keeps the designated requirement
 # constant across rebuilds, so the Accessibility grant (TCC) survives rebuilds.
 # If you ever change the identity or the grant misbehaves, run:
 #   tccutil reset Accessibility com.languageswitcher.mac
+#
+# Downloaded self-signed DMGs still need quarantine removal before first launch:
+#   ./scripts/remove-quarantine.sh dist/LanguageSwitcher-<version>.dmg
 
 echo "==> built: $APP_DIR"
 

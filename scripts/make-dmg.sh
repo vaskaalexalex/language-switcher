@@ -13,6 +13,10 @@
 #   ./scripts/make-dmg.sh                # uses version from Info.plist
 #   VERSION=1.2.3 ./scripts/make-dmg.sh  # override version
 #
+# Notarization (Developer ID builds):
+#   NOTARIZE=1 NOTARY_PROFILE=AC_PASSWORD ./scripts/make-dmg.sh
+#   NOTARIZE=1 NOTARY_PROFILE=AC_PASSWORD SIGN_IDENTITY="Developer ID Application: ..." ./build.sh dmg
+#
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -165,9 +169,48 @@ hdiutil convert "$RW_DMG" \
 
 # Codesign the DMG itself with the same identity used for the app, if present.
 SIGN_IDENTITY="${SIGN_IDENTITY:-LanguageSwitcher Local Dev}"
-if security find-identity -v -p codesigning 2>/dev/null | grep -q "$SIGN_IDENTITY"; then
+IS_DEVELOPER_ID=false
+if [[ "$SIGN_IDENTITY" == Developer\ ID* ]]; then
+  IS_DEVELOPER_ID=true
+fi
+
+if security find-identity -v -p codesigning 2>/dev/null | grep -Fq "$SIGN_IDENTITY"; then
   echo "==> codesigning DMG with '$SIGN_IDENTITY'"
-  codesign --force --sign "$SIGN_IDENTITY" --timestamp=none "$DMG_PATH" || true
+  if [ "$IS_DEVELOPER_ID" = true ]; then
+    codesign --force --sign "$SIGN_IDENTITY" --timestamp "$DMG_PATH"
+  else
+    codesign --force --sign "$SIGN_IDENTITY" --timestamp=none "$DMG_PATH" || true
+  fi
+fi
+
+SHOULD_NOTARIZE=false
+if [ "${NOTARIZE:-}" = "1" ] || [ "$IS_DEVELOPER_ID" = true ]; then
+  SHOULD_NOTARIZE=true
+fi
+
+if [ "$SHOULD_NOTARIZE" = true ]; then
+  NOTARY_PROFILE="${NOTARY_PROFILE:-}"
+  if [ -z "$NOTARY_PROFILE" ]; then
+    echo "warning: notarization skipped — set NOTARY_PROFILE to a notarytool keychain profile." >&2
+    echo "         Create one with: xcrun notarytool store-credentials AC_PASSWORD" >&2
+  else
+    echo "==> submitting DMG for notarization (profile: $NOTARY_PROFILE)"
+    xcrun notarytool submit "$DMG_PATH" \
+      --keychain-profile "$NOTARY_PROFILE" \
+      --wait
+
+    echo "==> stapling notarization ticket"
+    xcrun stapler staple "$DMG_PATH"
+
+    echo "==> verifying Gatekeeper acceptance"
+    if spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG_PATH"; then
+      echo "==> Gatekeeper: accepted"
+    else
+      echo "warning: spctl still rejected the DMG after notarization" >&2
+    fi
+  fi
+elif [ "$IS_DEVELOPER_ID" = false ]; then
+  echo "==> local-dev DMG: users may need ./scripts/remove-quarantine.sh before first launch"
 fi
 
 SIZE=$(du -h "$DMG_PATH" | awk '{print $1}')

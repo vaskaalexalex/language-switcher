@@ -43,6 +43,7 @@ final class TextReplacer {
             AccessibilityBridge.rangeAttribute($0, kAXSelectedTextRangeAttribute as String)
         }
         let hasSelection = (axRange?.length ?? 0) > 0
+        var selectionState: SelectionState = hasSelection ? .axNative : .unknown
         if let r = axRange {
             Log.info("AX range loc=\(r.location) len=\(r.length)")
         }
@@ -75,21 +76,26 @@ final class TextReplacer {
                 Log.info("Using AX value slice (\(snippet.count) chars)")
             }
 
-            if selected.isEmpty {
-                let newRange = CFRange(location: t.start, length: t.length)
-                let axSet = AccessibilityBridge.setRangeAttribute(
-                    element, kAXSelectedTextRangeAttribute as String, newRange)
-                Log.info("AX set range=\(axSet)")
+            let newRange = CFRange(location: t.start, length: t.length)
+            let axSet = AccessibilityBridge.setRangeAttribute(
+                element, kAXSelectedTextRangeAttribute as String, newRange)
+            Log.info("AX set range=\(axSet)")
 
-                if axSet {
-                    let verified = await waitUntil(pollNanoseconds: 5_000_000, maxAttempts: 6) {
-                        let verify = self.axSelectedText(element)
-                        return !verify.isEmpty && verify.count == t.length
+            if axSet {
+                let verified = await waitUntil(pollNanoseconds: 5_000_000, maxAttempts: 6) {
+                    if let range = AccessibilityBridge.rangeAttribute(
+                        element, kAXSelectedTextRangeAttribute as String
+                    ) {
+                        return range.location == t.start && range.length == t.length
                     }
-                    if verified {
-                        selected = axSelectedText(element)
-                        Log.info("AX selection verified (\(selected.count) chars)")
-                    }
+                    let verify = self.axSelectedText(element)
+                    return !verify.isEmpty && verify.count == t.length
+                }
+                if verified {
+                    selectionState = .axNative
+                    let axSelection = axSelectedText(element)
+                    if selected.isEmpty { selected = axSelection }
+                    Log.info("AX selection verified")
                 }
             }
 
@@ -99,6 +105,8 @@ final class TextReplacer {
                 if selected.isEmpty {
                     selected = t.snippet
                     Log.info("Synth select empty; falling back to AX target snippet")
+                } else {
+                    selectionState = .synth(length: t.length)
                 }
             }
         } else {
@@ -135,29 +143,50 @@ final class TextReplacer {
             replacementTarget = axTarget
         }
 
+        let expectedFullText: String? = {
+            guard let t = replacementTarget, let full = axFullText else { return nil }
+            return Self.replaceToken(
+                in: full, start: t.start, length: t.length, replacement: converted)
+        }()
+
         var replacementSucceeded = false
+        var usedPastePath = false
+
         if let element, let t = replacementTarget, let full = axFullText {
             replacementSucceeded = await tryAXValueReplacement(
                 element: element, fullText: full, target: t, converted: converted)
         }
 
         if !replacementSucceeded, let element {
-            if axSelectedText(element).isEmpty, let t = replacementTarget {
+            if selectionState.needsSyntheticSelection, let t = replacementTarget {
                 Log.info("Ensuring selection before AX/paste replacement")
-                _ = await selectExactTokenViaSynth(length: t.length)
+                let synthSelection = await selectExactTokenViaSynth(length: t.length)
+                if !synthSelection.isEmpty {
+                    selectionState = .synth(length: t.length)
+                }
             }
-            replacementSucceeded = await tryAXReplacement(element: element, converted: converted)
+            replacementSucceeded = await tryAXReplacement(
+                element: element,
+                converted: converted,
+                expectedFullText: expectedFullText)
         }
 
         if !replacementSucceeded {
-            if let t = replacementTarget, axSelectedText(element).isEmpty {
-                _ = await selectExactTokenViaSynth(length: t.length)
+            if selectionState.needsSyntheticSelection, let t = replacementTarget {
+                let synthSelection = await selectExactTokenViaSynth(length: t.length)
+                if !synthSelection.isEmpty {
+                    selectionState = .synth(length: t.length)
+                }
             }
-            await pasteReplacement(converted)
+            await pasteReplacement(
+                converted,
+                element: element,
+                expectedFullText: expectedFullText)
             replacementSucceeded = true
+            usedPastePath = true
         }
 
-        if replacementSucceeded {
+        if replacementSucceeded && !usedPastePath {
             await positionCaretAfterReplacement(
                 element: element, target: replacementTarget, converted: converted)
         }
@@ -176,6 +205,17 @@ final class TextReplacer {
         let start: Int
         let length: Int
         let snippet: String
+    }
+
+    private enum SelectionState {
+        case unknown
+        case axNative
+        case synth(length: Int)
+
+        var needsSyntheticSelection: Bool {
+            if case .unknown = self { return true }
+            return false
+        }
     }
 
     /// Inspects `AXValue` + the caret hint and returns the last whitespace-
@@ -343,7 +383,19 @@ final class TextReplacer {
     }
 
     @MainActor
-    private func tryAXReplacement(element: AXUIElement, converted: String) async -> Bool {
+    private func tryAXReplacement(
+        element: AXUIElement,
+        converted: String,
+        expectedFullText: String?
+    ) async -> Bool {
+        // Without an expected full AX value, direct writes are side effects we
+        // cannot verify. Let the paste path handle that case.
+        guard let expectedFullText else {
+            Log.info("AX direct write skipped (no expected AX value)")
+            return false
+        }
+
+        let preValue = AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String)
         guard AccessibilityBridge.setStringAttribute(
             element, kAXSelectedTextAttribute as String, converted
         ) else {
@@ -351,9 +403,19 @@ final class TextReplacer {
             return false
         }
 
+        // Only trust the write if we can observe AXValue actually change.
+        // Apps like VSCode return empty selected text regardless of state,
+        // so the previous `sel.isEmpty` check was a false positive.
+        guard let preValue else {
+            Log.info("AX direct write unverified (no AX value)")
+            return false
+        }
+
         let ok = await waitUntil(pollNanoseconds: 5_000_000, maxAttempts: 8) {
-            let sel = self.axSelectedText(element)
-            return sel.isEmpty || sel == converted
+            guard let current = AccessibilityBridge.stringAttribute(
+                element, kAXValueAttribute as String
+            ) else { return false }
+            return current != preValue && current == expectedFullText
         }
         Log.info("AX direct write \(ok ? "verified" : "unverified")")
         return ok
@@ -367,35 +429,28 @@ final class TextReplacer {
         target: TokenTarget?,
         converted: String
     ) async {
-        guard let target else {
-            await positionCaretViaSynth(converted: converted, expected: nil, element: element)
-            return
-        }
+        guard let target, let element else { return }
 
         let expected = Self.caretPositionAfterReplacement(start: target.start, converted: converted)
 
-        if let element {
-            for attempt in 0..<3 {
-                if attempt > 0 {
-                    try? await Task.sleep(nanoseconds: 8_000_000)
-                }
-                let set = AccessibilityBridge.setRangeAttribute(
-                    element, kAXSelectedTextRangeAttribute as String,
-                    CFRange(location: expected, length: 0))
-                if !set {
-                    Log.info("Caret AX set failed (attempt \(attempt + 1))")
-                    continue
-                }
-                try? await Task.sleep(nanoseconds: 5_000_000)
-                if caretMatches(element: element, expected: expected) {
-                    Log.info("Caret positioned via AX at \(expected)")
-                    return
-                }
+        for attempt in 0..<3 {
+            if attempt > 0 {
+                try? await Task.sleep(nanoseconds: 8_000_000)
             }
-            Log.info("Caret AX verify failed at expected=\(expected); using synth fallback")
+            let set = AccessibilityBridge.setRangeAttribute(
+                element, kAXSelectedTextRangeAttribute as String,
+                CFRange(location: expected, length: 0))
+            if !set {
+                Log.info("Caret AX set failed (attempt \(attempt + 1))")
+                continue
+            }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+            if caretMatches(element: element, expected: expected) {
+                Log.info("Caret positioned via AX at \(expected)")
+                return
+            }
         }
-
-        await positionCaretViaSynth(converted: converted, expected: expected, element: element)
+        Log.info("Caret AX verify failed at expected=\(expected)")
     }
 
     private func caretMatches(element: AXUIElement, expected: Int) -> Bool {
@@ -405,43 +460,6 @@ final class TextReplacer {
             return false
         }
         return range.length == 0 && range.location == expected
-    }
-
-    @MainActor
-    private func positionCaretViaSynth(
-        converted: String,
-        expected: Int?,
-        element: AXUIElement?
-    ) async {
-        let selLength = element.flatMap {
-            AccessibilityBridge.rangeAttribute($0, kAXSelectedTextRangeAttribute as String)?.length
-        } ?? 0
-
-        if selLength > 0 {
-            KeyboardSynth.moveCaretRight()
-            try? await Task.sleep(nanoseconds: 5_000_000)
-            if let element, let expected, caretMatches(element: element, expected: expected) {
-                Log.info("Caret positioned via synth (collapse selection)")
-                return
-            }
-        }
-
-        let steps = (converted as NSString).length
-        guard steps > 0 else { return }
-
-        for i in 0..<steps {
-            KeyboardSynth.moveCaretRight()
-            if i < steps - 1 {
-                usleep(1_000)
-            }
-        }
-        try? await Task.sleep(nanoseconds: 5_000_000)
-
-        if let element, let expected, caretMatches(element: element, expected: expected) {
-            Log.info("Caret positioned via synth (\(steps) steps)")
-        } else {
-            Log.info("Caret synth fallback completed (unverified)")
-        }
     }
 
     // MARK: - Adaptive waits
@@ -601,17 +619,36 @@ final class TextReplacer {
     // MARK: - Pasteboard write
 
     @MainActor
-    private func pasteReplacement(_ text: String) async {
+    private func pasteReplacement(
+        _ text: String,
+        element: AXUIElement? = nil,
+        expectedFullText: String? = nil
+    ) async {
         let pb = NSPasteboard.general
         let saved = savePasteboard(pb)
 
         pb.clearContents()
         pb.setString(text, forType: .string)
 
+        let pasteStarted = CACurrentMediaTime()
         KeyboardSynth.paste()
 
-        // Brief pause for paste to land, then restore clipboard.
-        try? await Task.sleep(nanoseconds: 15_000_000)
+        if let element, let expectedFullText {
+            let verified = await waitUntil(pollNanoseconds: 8_000_000, maxAttempts: 25) {
+                guard let current = AccessibilityBridge.stringAttribute(
+                    element, kAXValueAttribute as String
+                ) else { return false }
+                return current == expectedFullText
+            }
+            Log.info("Paste \(verified ? "verified" : "unverified")")
+        }
+
+        let elapsedNs = UInt64((CACurrentMediaTime() - pasteStarted) * 1_000_000_000)
+        let minNs: UInt64 = 60_000_000
+        if elapsedNs < minNs {
+            try? await Task.sleep(nanoseconds: minNs - elapsedNs)
+        }
+
         restorePasteboard(pb, items: saved)
     }
 

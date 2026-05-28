@@ -29,6 +29,12 @@ struct LayoutConverterTests {
     }
 
     @Test
+    func testNonLetterSymbolsStayInPlace() {
+        #expect(LayoutConverter.convert("ivan @#$^&?/ 123") == "шмфт @#$^&?/ 123")
+        #expect(LayoutConverter.convert("Иван @#$^&?/ 123") == "Bdfy @#$^&?/ 123")
+    }
+
+    @Test
     func testWrongLayoutWordWithComma() {
         #expect(LayoutConverter.convert("e,hfk") == "убрал")
     }
@@ -46,8 +52,12 @@ struct LayoutConverterTests {
 
     @Test
     func testRussianLettersCanMapToPhysicalSymbols() {
+        #expect(LayoutConverter.convert("бюэжхъё") == ",.';[]`")
+        #expect(LayoutConverter.convert("БЮЭЖХЪЁ") == "<>\":{}~")
         #expect(LayoutConverter.convert("х") == "[")
+        #expect(LayoutConverter.convert("Х") == "{")
         #expect(LayoutConverter.convert("ё") == "`")
+        #expect(LayoutConverter.convert("Ё") == "~")
     }
 
     @Test

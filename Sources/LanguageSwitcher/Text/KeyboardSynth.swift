@@ -42,11 +42,6 @@ enum KeyboardSynth {
         postKey(kVK_RightArrow, flags: [.maskShift])
     }
 
-    /// Move the caret one character to the right (→).
-    static func moveCaretRight() {
-        postKey(kVK_RightArrow, flags: [])
-    }
-
     static func paste() {
         postKey(kVK_ANSI_V, flags: [.maskCommand])
     }

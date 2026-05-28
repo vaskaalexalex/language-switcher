@@ -59,4 +59,10 @@ struct TextReplacerValueTests {
             in: "ab", range: range, fallbackSnippet: "xyz")
         #expect(target?.snippet == "xyz")
     }
+
+    @Test
+    func testCaretPositionAfterReplacement() {
+        #expect(TextReplacer.caretPositionAfterReplacement(start: 6, converted: "убрал") == 11)
+        #expect(TextReplacer.caretPositionAfterReplacement(start: 0, converted: "hello") == 5)
+    }
 }

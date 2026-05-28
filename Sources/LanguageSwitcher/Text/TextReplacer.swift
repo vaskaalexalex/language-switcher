@@ -135,25 +135,31 @@ final class TextReplacer {
             replacementTarget = axTarget
         }
 
-        var replaced = false
+        var replacementSucceeded = false
         if let element, let t = replacementTarget, let full = axFullText {
-            replaced = await tryAXValueReplacement(
+            replacementSucceeded = await tryAXValueReplacement(
                 element: element, fullText: full, target: t, converted: converted)
         }
 
-        if !replaced, let element {
+        if !replacementSucceeded, let element {
             if axSelectedText(element).isEmpty, let t = replacementTarget {
                 Log.info("Ensuring selection before AX/paste replacement")
                 _ = await selectExactTokenViaSynth(length: t.length)
             }
-            replaced = await tryAXReplacement(element: element, converted: converted)
+            replacementSucceeded = await tryAXReplacement(element: element, converted: converted)
         }
 
-        if !replaced {
+        if !replacementSucceeded {
             if let t = replacementTarget, axSelectedText(element).isEmpty {
                 _ = await selectExactTokenViaSynth(length: t.length)
             }
             await pasteReplacement(converted)
+            replacementSucceeded = true
+        }
+
+        if replacementSucceeded {
+            await positionCaretAfterReplacement(
+                element: element, target: replacementTarget, converted: converted)
         }
 
         if Preferences.shared.switchKeyboardLayout {
@@ -209,6 +215,11 @@ final class TextReplacer {
         let ns = text as NSString
         guard start >= 0, length >= 0, start + length <= ns.length else { return text }
         return ns.replacingCharacters(in: NSRange(location: start, length: length), with: replacement)
+    }
+
+    /// UTF-16 offset immediately after a replaced token.
+    static func caretPositionAfterReplacement(start: Int, converted: String) -> Int {
+        start + (converted as NSString).length
     }
 
     static func computeTokenTarget(in text: String, caretHint: Int?) -> (start: Int, length: Int, snippet: String)? {
@@ -321,11 +332,6 @@ final class TextReplacer {
             return false
         }
 
-        let newCaret = target.start + (converted as NSString).length
-        _ = AccessibilityBridge.setRangeAttribute(
-            element, kAXSelectedTextRangeAttribute as String,
-            CFRange(location: newCaret, length: 0))
-
         let ok = await waitUntil(pollNanoseconds: 5_000_000, maxAttempts: 10) {
             guard let current = AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String) else {
                 return false
@@ -351,6 +357,91 @@ final class TextReplacer {
         }
         Log.info("AX direct write \(ok ? "verified" : "unverified")")
         return ok
+    }
+
+    // MARK: - Post-replacement caret
+
+    @MainActor
+    private func positionCaretAfterReplacement(
+        element: AXUIElement?,
+        target: TokenTarget?,
+        converted: String
+    ) async {
+        guard let target else {
+            await positionCaretViaSynth(converted: converted, expected: nil, element: element)
+            return
+        }
+
+        let expected = Self.caretPositionAfterReplacement(start: target.start, converted: converted)
+
+        if let element {
+            for attempt in 0..<3 {
+                if attempt > 0 {
+                    try? await Task.sleep(nanoseconds: 8_000_000)
+                }
+                let set = AccessibilityBridge.setRangeAttribute(
+                    element, kAXSelectedTextRangeAttribute as String,
+                    CFRange(location: expected, length: 0))
+                if !set {
+                    Log.info("Caret AX set failed (attempt \(attempt + 1))")
+                    continue
+                }
+                try? await Task.sleep(nanoseconds: 5_000_000)
+                if caretMatches(element: element, expected: expected) {
+                    Log.info("Caret positioned via AX at \(expected)")
+                    return
+                }
+            }
+            Log.info("Caret AX verify failed at expected=\(expected); using synth fallback")
+        }
+
+        await positionCaretViaSynth(converted: converted, expected: expected, element: element)
+    }
+
+    private func caretMatches(element: AXUIElement, expected: Int) -> Bool {
+        guard let range = AccessibilityBridge.rangeAttribute(
+            element, kAXSelectedTextRangeAttribute as String
+        ) else {
+            return false
+        }
+        return range.length == 0 && range.location == expected
+    }
+
+    @MainActor
+    private func positionCaretViaSynth(
+        converted: String,
+        expected: Int?,
+        element: AXUIElement?
+    ) async {
+        let selLength = element.flatMap {
+            AccessibilityBridge.rangeAttribute($0, kAXSelectedTextRangeAttribute as String)?.length
+        } ?? 0
+
+        if selLength > 0 {
+            KeyboardSynth.moveCaretRight()
+            try? await Task.sleep(nanoseconds: 5_000_000)
+            if let element, let expected, caretMatches(element: element, expected: expected) {
+                Log.info("Caret positioned via synth (collapse selection)")
+                return
+            }
+        }
+
+        let steps = (converted as NSString).length
+        guard steps > 0 else { return }
+
+        for i in 0..<steps {
+            KeyboardSynth.moveCaretRight()
+            if i < steps - 1 {
+                usleep(1_000)
+            }
+        }
+        try? await Task.sleep(nanoseconds: 5_000_000)
+
+        if let element, let expected, caretMatches(element: element, expected: expected) {
+            Log.info("Caret positioned via synth (\(steps) steps)")
+        } else {
+            Log.info("Caret synth fallback completed (unverified)")
+        }
     }
 
     // MARK: - Adaptive waits

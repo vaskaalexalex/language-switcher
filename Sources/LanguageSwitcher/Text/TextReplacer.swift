@@ -26,6 +26,10 @@ final class TextReplacer {
         let started = CACurrentMediaTime()
         let frontmost = NSWorkspace.shared.frontmostApplication
         Log.info("Trigger fired (frontmost=\(frontmost?.bundleIdentifier ?? "nil"))")
+        let isElectron = FrontmostApp.isElectron(frontmost)
+        if isElectron {
+            Log.info("Electron app detected (\(frontmost?.bundleIdentifier ?? "nil")), using synth+paste pipeline")
+        }
 
         let element = AccessibilityBridge.focusedElement()
         if element == nil {
@@ -36,6 +40,11 @@ final class TextReplacer {
             Log.info("Secure field, skipping")
             NSSound.beep()
             return
+        }
+
+        let isRichText = element.map(AccessibilityBridge.supportsAttributedText) ?? false
+        if isRichText {
+            Log.info("Rich-text element detected, skipping AX value write")
         }
 
         // 1) Does the AX layer see an existing selection?
@@ -67,8 +76,17 @@ final class TextReplacer {
         // 3) Resolve text to convert.
         var selected = ""
         if hasSelection {
-            selected = axSelectedText(element)
-            if selected.isEmpty { selected = await clipboardRead() }
+            if isElectron {
+                selected = await clipboardRead()
+                if selected.isEmpty {
+                    Log.info("Electron selection clipboard empty; refusing AX selected text fallback")
+                } else {
+                    Log.info("Electron existing selection read via clipboard (\(selected.count) chars)")
+                }
+            } else {
+                selected = axSelectedText(element)
+                if selected.isEmpty { selected = await clipboardRead() }
+            }
         } else if let t = axTarget, let element {
             // Electron/Cursor: read the token straight from AXValue — no word-select needed.
             if let full = axFullText, let snippet = Self.snippet(from: full, start: t.start, length: t.length) {
@@ -76,43 +94,72 @@ final class TextReplacer {
                 Log.info("Using AX value slice (\(snippet.count) chars)")
             }
 
-            let newRange = CFRange(location: t.start, length: t.length)
-            let axSet = AccessibilityBridge.setRangeAttribute(
-                element, kAXSelectedTextRangeAttribute as String, newRange)
-            Log.info("AX set range=\(axSet)")
-
-            if axSet {
-                let verified = await waitUntil(pollNanoseconds: 5_000_000, maxAttempts: 6) {
-                    if let range = AccessibilityBridge.rangeAttribute(
-                        element, kAXSelectedTextRangeAttribute as String
-                    ) {
-                        return range.location == t.start && range.length == t.length
-                    }
-                    let verify = self.axSelectedText(element)
-                    return !verify.isEmpty && verify.count == t.length
-                }
-                if verified {
-                    selectionState = .axNative
-                    let axSelection = axSelectedText(element)
-                    if selected.isEmpty { selected = axSelection }
-                    Log.info("AX selection verified")
-                }
-            }
-
-            if selected.isEmpty {
-                Log.info("Selecting exact token length via synth (\(t.length) chars)")
-                selected = await selectExactTokenViaSynth(length: t.length)
-                if selected.isEmpty {
-                    selected = t.snippet
-                    Log.info("Synth select empty; falling back to AX target snippet")
-                } else {
+            if isElectron {
+                if await synthSelectAndVerify(length: t.length, expected: t.snippet) {
                     selectionState = .synth(length: t.length)
+                    selected = t.snippet
+                    Log.info("Synth selection verified (\(t.length) chars match AX snippet)")
+                } else {
+                    let realSelection = await clipboardRead()
+                    if !realSelection.isEmpty {
+                        Log.info("Synth selection mismatch; growing real selection from \(realSelection.debugDescription)")
+                        let grown = await growSelectionLeftToWhitespace(initial: realSelection)
+                        selectionState = .synth(length: (grown as NSString).length)
+                        selected = grown
+                        if grown != realSelection {
+                            Log.info("Grew Electron selection len \(realSelection.count) -> \(grown.count)")
+                        } else {
+                            Log.info("Electron selection did not grow")
+                        }
+                    } else {
+                        selected = ""
+                        Log.info("Synth selection empty; refusing AX target snippet fallback")
+                    }
+                }
+            } else {
+                let newRange = CFRange(location: t.start, length: t.length)
+                let axSet = AccessibilityBridge.setRangeAttribute(
+                    element, kAXSelectedTextRangeAttribute as String, newRange)
+                Log.info("AX set range=\(axSet)")
+
+                if axSet {
+                    let verified = await waitUntil(pollNanoseconds: 5_000_000, maxAttempts: 6) {
+                        if let range = AccessibilityBridge.rangeAttribute(
+                            element, kAXSelectedTextRangeAttribute as String
+                        ) {
+                            return range.location == t.start && range.length == t.length
+                        }
+                        let verify = self.axSelectedText(element)
+                        return !verify.isEmpty && verify.count == t.length
+                    }
+                    if verified {
+                        selectionState = .axNative
+                        let axSelection = axSelectedText(element)
+                        if selected.isEmpty { selected = axSelection }
+                        Log.info("AX selection verified")
+                    }
+                }
+
+                if selected.isEmpty {
+                    Log.info("Selecting exact token length via synth (\(t.length) chars)")
+                    selected = await selectExactTokenViaSynth(length: t.length)
+                    if selected.isEmpty {
+                        selected = t.snippet
+                        Log.info("Synth select empty; falling back to AX target snippet")
+                    } else {
+                        selectionState = .synth(length: t.length)
+                    }
                 }
             }
         } else {
             Log.info("No AX data, using synth + char-grow")
             KeyboardSynth.selectPreviousWord()
-            selected = await waitForSelection(element: element, viaClipboard: true, maxAttempts: 5, pollNanoseconds: 8_000_000)
+            let selectionElement = isElectron ? nil : element
+            selected = await waitForSelection(
+                element: selectionElement,
+                viaClipboard: true,
+                maxAttempts: 5,
+                pollNanoseconds: 8_000_000)
             if !selected.isEmpty {
                 let grown = await growSelectionLeftToWhitespace(initial: selected)
                 if grown != selected {
@@ -152,7 +199,14 @@ final class TextReplacer {
         var replacementSucceeded = false
         var usedPastePath = false
 
-        if let element, let t = replacementTarget, let full = axFullText {
+        if isElectron {
+            Log.info("Electron path: replacing real selection via paste")
+            await pasteReplacement(converted)
+            replacementSucceeded = true
+            usedPastePath = true
+        }
+
+        if !replacementSucceeded, let element, !isRichText, let t = replacementTarget, let full = axFullText {
             replacementSucceeded = await tryAXValueReplacement(
                 element: element, fullText: full, target: t, converted: converted)
         }
@@ -506,6 +560,22 @@ final class TextReplacer {
     }
 
     // MARK: - Exact-length synthetic selection
+
+    @MainActor
+    private func synthSelectAndVerify(length: Int, expected: String) async -> Bool {
+        guard length > 0 else { return false }
+
+        let pb = NSPasteboard.general
+        let saved = savePasteboard(pb)
+        defer { restorePasteboard(pb, items: saved) }
+
+        for _ in 0..<length {
+            KeyboardSynth.extendSelectionLeftChar()
+        }
+
+        let copied = await copySelection(pb)
+        return copied == expected
+    }
 
     /// Select exactly `length` characters left of the caret using ⇧← bursts.
     /// Avoids ⌥⇧← word boundaries that split tokens like `e,рал` in Electron.

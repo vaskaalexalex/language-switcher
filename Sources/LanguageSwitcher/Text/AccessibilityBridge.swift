@@ -50,6 +50,15 @@ enum AccessibilityBridge {
         return err == .success
     }
 
+    static func supportsAttributedText(_ element: AXUIElement) -> Bool {
+        var value: CFArray?
+        let err = AXUIElementCopyParameterizedAttributeNames(element, &value)
+        guard err == .success, let names = value as? [Any] else { return false }
+
+        let target = kAXAttributedStringForRangeParameterizedAttribute as String
+        return names.contains { ($0 as? String) == target }
+    }
+
     static func isSecureField(_ element: AXUIElement) -> Bool {
         if let subrole = stringAttribute(element, kAXSubroleAttribute) {
             return subrole == (kAXSecureTextFieldSubrole as String)

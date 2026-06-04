@@ -70,4 +70,60 @@ struct LayoutConverterTests {
     func testWhitespaceAndNewlinesStayInPlace() {
         #expect(LayoutConverter.convert("hi there\nagain") == "рш еруку\nфпфшт")
     }
+
+    // MARK: - Round-trip (the table is a bijection for the mapped keys)
+
+    @Test
+    func testFullLowercaseAlphabetRoundTrips() {
+        let en = "qwertyuiopasdfghjklzxcvbnm"
+        let ru = LayoutConverter.convert(en)
+        #expect(ru == "йцукенгшщзфывапролдячсмить")
+        #expect(LayoutConverter.convert(ru) == en)
+    }
+
+    @Test
+    func testFullUppercaseAlphabetRoundTrips() {
+        let en = "QWERTYUIOPASDFGHJKLZXCVBNM"
+        let ru = LayoutConverter.convert(en)
+        // Pin the intermediate too, so a symmetric mangling can't slip through.
+        #expect(ru == "ЙЦУКЕНГШЩЗФЫВАПРОЛДЯЧСМИТЬ")
+        #expect(LayoutConverter.convert(ru) == en)
+    }
+
+    @Test
+    func testWordsRoundTripEnRuEn() {
+        for word in ["hello", "world", "ghbdtn", "swift", "keyboard"] {
+            #expect(LayoutConverter.convert(LayoutConverter.convert(word)) == word)
+        }
+    }
+
+    @Test
+    func testPunctuationKeyedLettersRoundTrip() {
+        // Words whose Russian letters come from punctuation keys (б ю э ж х ъ ё).
+        for word in ["e,hfk", "убрал"] {
+            #expect(LayoutConverter.convert(LayoutConverter.convert(word)) == word)
+        }
+        #expect(LayoutConverter.convert("убрал") == "e,hfk")
+    }
+
+    @Test
+    func testDigitsAndSpacesArePreserved() {
+        #expect(LayoutConverter.convert("12345 67890") == "12345 67890")
+        #expect(LayoutConverter.convert("  ") == "  ")
+    }
+
+    @Test
+    func testSingleLetterConversions() {
+        #expect(LayoutConverter.convert("f") == "а")
+        #expect(LayoutConverter.convert("а") == "f")
+        #expect(LayoutConverter.convert("q") == "й")
+        #expect(LayoutConverter.convert("й") == "q")
+    }
+
+    @Test
+    func testNonConvertibleCharactersPassThrough() {
+        // Emoji and characters outside both layouts are emitted unchanged.
+        #expect(LayoutConverter.convert("👍") == "👍")
+        #expect(LayoutConverter.convert("hi 👍 there") == "рш 👍 еруку")
+    }
 }

@@ -95,7 +95,7 @@ final class TextReplacer {
             }
 
             if isElectron {
-                if await synthSelectAndVerify(length: t.length, expected: t.snippet) {
+                if await synthSelectAndVerify(expected: t.snippet) {
                     selectionState = .synth(length: t.length)
                     selected = t.snippet
                     Log.info("Synth selection verified (\(t.length) chars match AX snippet)")
@@ -141,8 +141,8 @@ final class TextReplacer {
                 }
 
                 if selected.isEmpty {
-                    Log.info("Selecting exact token length via synth (\(t.length) chars)")
-                    selected = await selectExactTokenViaSynth(length: t.length)
+                    Log.info("Selecting exact token via synth (\(Self.synthSelectionSteps(for: t.snippet)) graphemes)")
+                    selected = await selectExactTokenViaSynth(graphemeCount: Self.synthSelectionSteps(for: t.snippet))
                     if selected.isEmpty {
                         selected = t.snippet
                         Log.info("Synth select empty; falling back to AX target snippet")
@@ -192,7 +192,7 @@ final class TextReplacer {
 
         let expectedFullText: String? = {
             guard let t = replacementTarget, let full = axFullText else { return nil }
-            return Self.replaceToken(
+            return Self.plannedReplacement(
                 in: full, start: t.start, length: t.length, replacement: converted)
         }()
 
@@ -214,7 +214,7 @@ final class TextReplacer {
         if !replacementSucceeded, let element {
             if selectionState.needsSyntheticSelection, let t = replacementTarget {
                 Log.info("Ensuring selection before AX/paste replacement")
-                let synthSelection = await selectExactTokenViaSynth(length: t.length)
+                let synthSelection = await selectExactTokenViaSynth(graphemeCount: Self.synthSelectionSteps(for: t.snippet))
                 if !synthSelection.isEmpty {
                     selectionState = .synth(length: t.length)
                 }
@@ -225,9 +225,36 @@ final class TextReplacer {
                 expectedFullText: expectedFullText)
         }
 
+        // Idempotency guard — the core fix for the "converted text is
+        // duplicated, can't be undone with Cmd+Z" bug. An AX write above can
+        // physically land even when its own verification timed out (lagging
+        // AXValue). Re-read the value before pasting: if the conversion is
+        // already present, pasting would insert a second copy, and because the
+        // AX write and the paste are separate edits a single Cmd+Z can't undo
+        // it. We only get here when both AX strategies reported failure, so the
+        // only writer that could have changed the field is us — hence an
+        // unexpected change (`.ambiguous`) is also treated as "don't paste
+        // again", trading a rare wrong-but-single result for never duplicating.
+        if !replacementSucceeded, let element, let expectedFullText {
+            let applied = await waitUntil(pollNanoseconds: 8_000_000, maxAttempts: 8) {
+                AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String) == expectedFullText
+            }
+            if applied {
+                Log.info("AX write already applied; skipping paste to avoid duplicate")
+                replacementSucceeded = true
+            } else if Self.classifyAXWrite(
+                preValue: axFullText,
+                currentValue: AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String),
+                expectedFullText: expectedFullText
+            ) == .ambiguous {
+                Log.info("Field changed after AX write; skipping paste to avoid duplicate")
+                replacementSucceeded = true
+            }
+        }
+
         if !replacementSucceeded {
             if selectionState.needsSyntheticSelection, let t = replacementTarget {
-                let synthSelection = await selectExactTokenViaSynth(length: t.length)
+                let synthSelection = await selectExactTokenViaSynth(graphemeCount: Self.synthSelectionSteps(for: t.snippet))
                 if !synthSelection.isEmpty {
                     selectionState = .synth(length: t.length)
                 }
@@ -286,7 +313,11 @@ final class TextReplacer {
     static func snippet(from text: String, start: Int, length: Int) -> String? {
         let ns = text as NSString
         guard start >= 0, length > 0, start + length <= ns.length else { return nil }
-        return ns.substring(with: NSRange(location: start, length: length))
+        let range = NSRange(location: start, length: length)
+        // Never slice through a surrogate pair / composed character sequence —
+        // that yields mojibake. If the range isn't grapheme-aligned, refuse.
+        guard ns.rangeOfComposedCharacterSequences(for: range) == range else { return nil }
+        return ns.substring(with: range)
     }
 
     /// Explicit AX selection range — not the last-token heuristic.
@@ -308,12 +339,74 @@ final class TextReplacer {
     static func replaceToken(in text: String, start: Int, length: Int, replacement: String) -> String {
         let ns = text as NSString
         guard start >= 0, length >= 0, start + length <= ns.length else { return text }
-        return ns.replacingCharacters(in: NSRange(location: start, length: length), with: replacement)
+        let range = NSRange(location: start, length: length)
+        // Refuse to splice across a surrogate pair / composed character
+        // sequence; doing so would corrupt the surrounding glyph.
+        if length > 0, ns.rangeOfComposedCharacterSequences(for: range) != range { return text }
+        return ns.replacingCharacters(in: range, with: replacement)
+    }
+
+    /// The full text after replacing the target token, or `nil` when the
+    /// replacement is a no-op — either because the converted text is identical
+    /// or because `replaceToken` refused an unaligned (grapheme-splitting)
+    /// range. Returning `nil` keeps the cascade from mistaking an unchanged
+    /// write for a successful conversion: without this, a bad selection range
+    /// makes the AX value write "verify" instantly against the original text
+    /// and silently drops the conversion. `nil` instead routes to the paste
+    /// path, which overwrites the real selection.
+    static func plannedReplacement(
+        in full: String, start: Int, length: Int, replacement: String
+    ) -> String? {
+        let result = replaceToken(in: full, start: start, length: length, replacement: replacement)
+        return result == full ? nil : result
     }
 
     /// UTF-16 offset immediately after a replaced token.
     static func caretPositionAfterReplacement(start: Int, converted: String) -> Int {
         start + (converted as NSString).length
+    }
+
+    /// Result of inspecting the focused element's value after an AX write
+    /// attempt — used to decide whether a *second* (duplicating) mutation is
+    /// needed. See the paste guard in `run()`.
+    enum AXWriteOutcome: Equatable {
+        /// The field already holds the converted result — do nothing more.
+        case applied
+        /// The field is unchanged — another strategy may safely apply it.
+        case notApplied
+        /// The field changed but not to the expected value — applying again
+        /// risks duplicating text, so the cascade should stop.
+        case ambiguous
+    }
+
+    /// Pure classifier at the heart of the duplication fix.
+    ///
+    /// An AX write can land in the target app even when its own verification
+    /// read times out (some apps expose a lagging `AXValue`). If the cascade
+    /// then pastes the conversion again the user gets a duplicate that a single
+    /// Cmd+Z can't undo, because the AX write and the paste are separate edits.
+    /// Given the value before any write (`preValue`), the value observed now
+    /// (`currentValue`), and the expected post-conversion value, decide whether
+    /// a prior write already produced (or partially produced) the result so the
+    /// caller can suppress the second mutation.
+    static func classifyAXWrite(
+        preValue: String?,
+        currentValue: String?,
+        expectedFullText: String?
+    ) -> AXWriteOutcome {
+        guard let expectedFullText else { return .notApplied }
+        guard let currentValue else { return .notApplied }
+        if currentValue == expectedFullText { return .applied }
+        if let preValue, currentValue != preValue { return .ambiguous }
+        return .notApplied
+    }
+
+    /// Number of caret-stop key presses (⇧←) needed to traverse `token`.
+    /// The caret moves by grapheme cluster, not UTF-16 code unit, so synthetic
+    /// selection must count graphemes. Driving the loop by `NSString.length`
+    /// over-selects on emoji / combining marks and converts the wrong span.
+    static func synthSelectionSteps(for token: String) -> Int {
+        token.count
     }
 
     static func computeTokenTarget(in text: String, caretHint: Int?) -> (start: Int, length: Int, snippet: String)? {
@@ -381,20 +474,28 @@ final class TextReplacer {
 
         guard wsStart == effectiveEnd, effectiveEnd > 0 else { return nil }
 
-        let lastChar = ns.substring(with: NSRange(location: effectiveEnd - 1, length: 1))
-        guard endsWithLetterOrDigit(lastChar) else { return nil }
-
         let start = scanBackToWhitespace(in: ns, from: effectiveEnd, whitespace: whitespace)
         let length = effectiveEnd - start
         guard length > 0 else { return nil }
 
         let snippet = ns.substring(with: NSRange(location: start, length: length))
+
+        // Accept a letter-bearing word even when it ends in punctuation (e.g.
+        // "hello," / "привет;") so the common case matches what the in-caret
+        // branch returns one character earlier — otherwise the Option-tap is a
+        // silent no-op for a punctuated word followed by a space. Two
+        // deliberate exclusions (these diverge from the in-caret branch, but
+        // only on tokens LayoutConverter wouldn't meaningfully convert anyway):
+        //   - a token with no letter (digits / punctuation only) — nothing to fix;
+        //   - a "prefix:" marker ending in a colon (the git branch line
+        //     "main: ") — there is no real word to convert.
+        guard tokenContainsLetter(snippet), !snippet.hasSuffix(":") else { return nil }
+
         return (start: start, length: length, snippet: snippet)
     }
 
-    private static func endsWithLetterOrDigit(_ ch: String) -> Bool {
-        guard let scalar = ch.unicodeScalars.first else { return false }
-        return CharacterSet.alphanumerics.contains(scalar)
+    private static func tokenContainsLetter(_ token: String) -> Bool {
+        token.contains { $0.isLetter }
     }
 
     private static func scanBackToWhitespace(in ns: NSString, from caret: Int, whitespace: CharacterSet) -> Int {
@@ -416,8 +517,16 @@ final class TextReplacer {
         target: TokenTarget,
         converted: String
     ) async -> Bool {
-        let expected = Self.replaceToken(
-            in: fullText, start: target.start, length: target.length, replacement: converted)
+        // Bail if the replacement is a no-op (identical text, or an unaligned
+        // range `replaceToken` refused): writing the unchanged value would
+        // "verify" instantly and silently drop the conversion. Let the paste
+        // path handle it instead.
+        guard let expected = Self.plannedReplacement(
+            in: fullText, start: target.start, length: target.length, replacement: converted
+        ) else {
+            Log.info("AX value write skipped (replacement is a no-op for this range)")
+            return false
+        }
 
         guard AccessibilityBridge.setStringAttribute(
             element, kAXValueAttribute as String, expected
@@ -426,7 +535,7 @@ final class TextReplacer {
             return false
         }
 
-        let ok = await waitUntil(pollNanoseconds: 5_000_000, maxAttempts: 10) {
+        let ok = await waitUntil(pollNanoseconds: 8_000_000, maxAttempts: 25) {
             guard let current = AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String) else {
                 return false
             }
@@ -449,7 +558,19 @@ final class TextReplacer {
             return false
         }
 
-        let preValue = AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String)
+        // Read a baseline AXValue *before* mutating. Writing
+        // kAXSelectedTextAttribute physically replaces the selected token; if
+        // we can't read AXValue we can't tell whether it landed, and a blind,
+        // unverifiable write here would be re-applied by the paste fallback and
+        // duplicate the text. So bail before touching the field. (The old code
+        // checked this guard *after* the write — the bug behind the duplicate.)
+        guard let preValue = AccessibilityBridge.stringAttribute(
+            element, kAXValueAttribute as String
+        ) else {
+            Log.info("AX direct write skipped (AXValue unreadable, can't verify)")
+            return false
+        }
+
         guard AccessibilityBridge.setStringAttribute(
             element, kAXSelectedTextAttribute as String, converted
         ) else {
@@ -457,15 +578,11 @@ final class TextReplacer {
             return false
         }
 
-        // Only trust the write if we can observe AXValue actually change.
-        // Apps like VSCode return empty selected text regardless of state,
-        // so the previous `sel.isEmpty` check was a false positive.
-        guard let preValue else {
-            Log.info("AX direct write unverified (no AX value)")
-            return false
-        }
-
-        let ok = await waitUntil(pollNanoseconds: 5_000_000, maxAttempts: 8) {
+        // Trust the write only once we observe AXValue become the expected
+        // text. Some apps expose a lagging AXValue, so poll the same ~200ms
+        // window the paste path uses rather than ~40ms — the tight window was
+        // timing out on slow apps and forcing a duplicating paste.
+        let ok = await waitUntil(pollNanoseconds: 8_000_000, maxAttempts: 25) {
             guard let current = AccessibilityBridge.stringAttribute(
                 element, kAXValueAttribute as String
             ) else { return false }
@@ -562,14 +679,15 @@ final class TextReplacer {
     // MARK: - Exact-length synthetic selection
 
     @MainActor
-    private func synthSelectAndVerify(length: Int, expected: String) async -> Bool {
-        guard length > 0 else { return false }
+    private func synthSelectAndVerify(expected: String) async -> Bool {
+        let steps = Self.synthSelectionSteps(for: expected)
+        guard steps > 0 else { return false }
 
         let pb = NSPasteboard.general
         let saved = savePasteboard(pb)
         defer { restorePasteboard(pb, items: saved) }
 
-        for _ in 0..<length {
+        for _ in 0..<steps {
             KeyboardSynth.extendSelectionLeftChar()
         }
 
@@ -580,14 +698,14 @@ final class TextReplacer {
     /// Select exactly `length` characters left of the caret using ⇧← bursts.
     /// Avoids ⌥⇧← word boundaries that split tokens like `e,рал` in Electron.
     @MainActor
-    private func selectExactTokenViaSynth(length: Int) async -> String {
-        guard length > 0 else { return "" }
+    private func selectExactTokenViaSynth(graphemeCount: Int) async -> String {
+        guard graphemeCount > 0 else { return "" }
 
         let pb = NSPasteboard.general
         let saved = savePasteboard(pb)
         defer { restorePasteboard(pb, items: saved) }
 
-        for _ in 0..<length {
+        for _ in 0..<graphemeCount {
             KeyboardSynth.extendSelectionLeftChar()
         }
 
@@ -714,7 +832,13 @@ final class TextReplacer {
         }
 
         let elapsedNs = UInt64((CACurrentMediaTime() - pasteStarted) * 1_000_000_000)
-        let minNs: UInt64 = 60_000_000
+        // When we can verify against AXValue we already polled until the field
+        // changed, so a short settle is enough. When we can't (the Electron
+        // paste path passes no element), hold the converted text on the
+        // pasteboard longer: synthetic Cmd+V is consumed asynchronously, and
+        // restoring the clipboard too early lets the app paste stale text.
+        let canVerify = element != nil && expectedFullText != nil
+        let minNs: UInt64 = canVerify ? 60_000_000 : 150_000_000
         if elapsedNs < minNs {
             try? await Task.sleep(nanoseconds: minNs - elapsedNs)
         }

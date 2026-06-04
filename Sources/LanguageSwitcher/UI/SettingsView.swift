@@ -4,6 +4,7 @@ import AppKit
 struct SettingsView: View {
     @EnvironmentObject var prefs: Preferences
     @State private var selection: String?
+    @State private var logsCopied = false
 
     var body: some View {
         TabView {
@@ -42,6 +43,25 @@ struct SettingsView: View {
                 }
                 .disabled(!UpdateService.shared.canCheckForUpdates)
             }
+            Divider()
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Diagnostics")
+                    .font(.headline)
+                Text("If a conversion misbehaves, copy the recent logs and send them to the developer. They include each conversion's before → after text and which method was used.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button(logsCopied ? "Copied ✓" : "Copy Logs for Bug Report") {
+                        Diagnostics.copyRecentToPasteboard()
+                        logsCopied = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { logsCopied = false }
+                    }
+                    Button("Reveal Log in Finder") {
+                        Diagnostics.revealLogInFinder()
+                    }
+                }
+            }
+            .padding(.top, 4)
         }
         .padding()
     }

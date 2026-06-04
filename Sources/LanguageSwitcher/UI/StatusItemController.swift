@@ -106,6 +106,25 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         updates.isEnabled = canCheckForUpdates()
         menu.addItem(updates)
 
+        let diagnostics = NSMenuItem(title: "Diagnostics", action: nil, keyEquivalent: "")
+        let diagMenu = NSMenu()
+        let copyLogs = NSMenuItem(
+            title: "Copy Logs for Bug Report",
+            action: #selector(handleCopyDiagnostics),
+            keyEquivalent: ""
+        )
+        copyLogs.target = self
+        diagMenu.addItem(copyLogs)
+        let revealLog = NSMenuItem(
+            title: "Reveal Log in Finder",
+            action: #selector(handleRevealLog),
+            keyEquivalent: ""
+        )
+        revealLog.target = self
+        diagMenu.addItem(revealLog)
+        diagnostics.submenu = diagMenu
+        menu.addItem(diagnostics)
+
         menu.addItem(NSMenuItem.separator())
 
         let version = NSMenuItem(
@@ -137,4 +156,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func handleCheckForUpdates() { onCheckForUpdates() }
     @objc private func handleOpenAccessibility() { onOpenAccessibility() }
     @objc private func handleQuit() { onQuit() }
+
+    @objc private func handleCopyDiagnostics() {
+        let count = Diagnostics.copyRecentToPasteboard()
+        Log.info("Diagnostics copied to clipboard (\(count) chars)")
+    }
+
+    @objc private func handleRevealLog() {
+        Diagnostics.revealLogInFinder()
+    }
 }

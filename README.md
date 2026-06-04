@@ -173,3 +173,28 @@ Option-tap
 - **Option behaves oddly for typing accented characters.** That's not
   LanguageSwitcher — tap-and-release with no other key is what triggers it;
   holding Option to type `ø`, `é`, etc. works as before.
+
+## Reporting a bug (diagnostics)
+
+If a conversion misbehaves — text duplicated, the wrong number of words
+converted, nothing happens — capture a report right after it happens:
+
+1. Reproduce the issue (tap Option on the text that converts wrong).
+2. Menu-bar icon → **Diagnostics → Copy Logs for Bug Report**
+   (or Settings… → General → Diagnostics → *Copy Logs for Bug Report*).
+3. Paste the clipboard into your report.
+
+The app writes a plain-text log to
+`~/Library/Logs/LanguageSwitcherMac/app.log` (use **Reveal Log in Finder**
+to attach the whole file). Each conversion ends with a single grep-able
+line, e.g.:
+
+```text
+SUMMARY app=com.microsoft.VSCode electron=true selection=false richText=true "vtyz" -> "меня" pastePath=true ok=true
+```
+
+That line shows the frontmost app, whether it was an Electron / selection /
+rich-text context, the original text → the converted text, which path was
+used, and whether it succeeded — which is what's needed to diagnose the
+duplication and word-count cases. The log contains the text you converted,
+so review it before sharing. Everything stays local; nothing is uploaded.

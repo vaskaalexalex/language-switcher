@@ -278,6 +278,14 @@ final class TextReplacer {
 
         let elapsed = (CACurrentMediaTime() - started) * 1000
         Log.info(String(format: "Conversion finished in %.0f ms", elapsed))
+
+        // One grep-able line per conversion: what was there, what it became,
+        // and how — this is the line a bug report should center on.
+        Log.info(
+            "SUMMARY app=\(frontmost?.bundleIdentifier ?? "nil") electron=\(isElectron) "
+            + "selection=\(hasSelection) richText=\(isRichText) "
+            + "\(selected.debugDescription) -> \(converted.debugDescription) "
+            + "pastePath=\(usedPastePath) ok=\(replacementSucceeded)")
     }
 
     // MARK: - Target computation

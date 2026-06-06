@@ -68,7 +68,12 @@ final class TextReplacer {
         var axFullText: String?
         if let element {
             axFullText = AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String)
-            if !hasSelection {
+            // In a terminal (force-paste) the AXValue is the whole scrollback
+            // buffer and the "last token" is stale output, not the editable
+            // prompt — so don't anchor on it. Leaving axTarget nil routes the
+            // conversion to the pure synthetic-selection path, which selects the
+            // last word from the real caret (and beeps if the prompt is empty).
+            if !hasSelection && !isForcePaste {
                 axTarget = axFullText.flatMap { Self.computeTokenTarget(in: $0, caretHint: caretPosition) }
                     .map { TokenTarget(start: $0.start, length: $0.length, snippet: $0.snippet) }
             }

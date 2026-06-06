@@ -28,4 +28,16 @@ struct FrontmostAppTests {
 
         #expect(FrontmostApp.isElectronBundle(at: root) == true)
     }
+
+    @Test
+    func testForcePasteClassifiesModernTerminals() {
+        // Warp and other AX-write-hostile terminals route through the paste
+        // pipeline like Electron.
+        #expect(FrontmostApp.isForcePasteBundleId("dev.warp.Warp-Stable") == true)
+        #expect(FrontmostApp.isForcePasteBundleId("com.mitchellh.ghostty") == true)
+        // Regular apps and Electron apps are not force-paste (Electron is
+        // detected separately by its framework).
+        #expect(FrontmostApp.isForcePasteBundleId("com.microsoft.VSCode") == false)
+        #expect(FrontmostApp.isForcePasteBundleId("com.apple.TextEdit") == false)
+    }
 }

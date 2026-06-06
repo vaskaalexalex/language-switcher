@@ -27,8 +27,12 @@ final class TextReplacer {
         let frontmost = NSWorkspace.shared.frontmostApplication
         Log.info("Trigger fired (frontmost=\(frontmost?.bundleIdentifier ?? "nil"))")
         let isElectron = FrontmostApp.isElectron(frontmost)
-        if isElectron {
-            Log.info("Electron app detected (\(frontmost?.bundleIdentifier ?? "nil")), using synth+paste pipeline")
+        let isForcePaste = FrontmostApp.isForcePasteApp(frontmost)
+        // Both Electron apps and AX-write-hostile terminals (Warp, Ghostty, …)
+        // bypass AX writes and replace via synthetic selection + paste.
+        let usesPastePipeline = isElectron || isForcePaste
+        if usesPastePipeline {
+            Log.info("Paste pipeline for \(frontmost?.bundleIdentifier ?? "nil") (electron=\(isElectron) forcePaste=\(isForcePaste))")
         }
 
         let element = AccessibilityBridge.focusedElement()
@@ -76,12 +80,12 @@ final class TextReplacer {
         // 3) Resolve text to convert.
         var selected = ""
         if hasSelection {
-            if isElectron {
+            if usesPastePipeline {
                 selected = await clipboardRead()
                 if selected.isEmpty {
-                    Log.info("Electron selection clipboard empty; refusing AX selected text fallback")
+                    Log.info("Paste-pipeline selection clipboard empty; refusing AX selected text fallback")
                 } else {
-                    Log.info("Electron existing selection read via clipboard (\(selected.count) chars)")
+                    Log.info("Paste-pipeline existing selection read via clipboard (\(selected.count) chars)")
                 }
             } else {
                 selected = axSelectedText(element)
@@ -94,7 +98,7 @@ final class TextReplacer {
                 Log.info("Using AX value slice (\(snippet.count) chars)")
             }
 
-            if isElectron {
+            if usesPastePipeline {
                 if await synthSelectAndVerify(expected: t.snippet) {
                     selectionState = .synth(length: t.length)
                     selected = t.snippet
@@ -107,9 +111,9 @@ final class TextReplacer {
                         selectionState = .synth(length: (grown as NSString).length)
                         selected = grown
                         if grown != realSelection {
-                            Log.info("Grew Electron selection len \(realSelection.count) -> \(grown.count)")
+                            Log.info("Grew paste-pipeline selection len \(realSelection.count) -> \(grown.count)")
                         } else {
-                            Log.info("Electron selection did not grow")
+                            Log.info("Paste-pipeline selection did not grow")
                         }
                     } else {
                         selected = ""
@@ -154,7 +158,7 @@ final class TextReplacer {
         } else {
             Log.info("No AX data, using synth + char-grow")
             KeyboardSynth.selectPreviousWord()
-            let selectionElement = isElectron ? nil : element
+            let selectionElement = usesPastePipeline ? nil : element
             selected = await waitForSelection(
                 element: selectionElement,
                 viaClipboard: true,
@@ -199,8 +203,8 @@ final class TextReplacer {
         var replacementSucceeded = false
         var usedPastePath = false
 
-        if isElectron {
-            Log.info("Electron path: replacing real selection via paste")
+        if usesPastePipeline {
+            Log.info("Paste pipeline: replacing real selection via paste")
             await pasteReplacement(converted)
             replacementSucceeded = true
             usedPastePath = true
@@ -283,7 +287,7 @@ final class TextReplacer {
         // and how — this is the line a bug report should center on.
         Log.info(
             "SUMMARY app=\(frontmost?.bundleIdentifier ?? "nil") electron=\(isElectron) "
-            + "selection=\(hasSelection) richText=\(isRichText) "
+            + "forcePaste=\(isForcePaste) selection=\(hasSelection) richText=\(isRichText) "
             + "\(selected.debugDescription) -> \(converted.debugDescription) "
             + "pastePath=\(usedPastePath) ok=\(replacementSucceeded)")
     }

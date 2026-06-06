@@ -12,6 +12,23 @@ final class Preferences: ObservableObject {
         static let seededDefaults = "puntoSwitcher.seededDefaults"
         static let seededLaunchAtLogin = "puntoSwitcher.seededLaunchAtLogin"
         static let switchKeyboardLayout = "puntoSwitcher.switchKeyboardLayout"
+        static let migratedHostileTerminals = "puntoSwitcher.migratedHostileTerminals"
+    }
+
+    /// Terminals that can't be automated for conversion: they don't expose a
+    /// writable/selectable text surface, so a synthetic selection just dances
+    /// the caret without ever yielding text. Always skipped, like Apple
+    /// Terminal / iTerm2.
+    static let hostileTerminalIds = [
+        "dev.warp.Warp-Stable",
+        "dev.warp.Warp-Beta",
+    ]
+
+    /// `blacklist` with the hostile terminals merged in (sorted, de-duplicated).
+    static func ensuringHostileTerminals(in blacklist: [String]) -> [String] {
+        var merged = Set(blacklist)
+        for id in hostileTerminalIds { merged.insert(id) }
+        return Array(merged).sorted()
     }
 
     private let defaults = UserDefaults.standard
@@ -66,8 +83,15 @@ final class Preferences: ObservableObject {
             ]
             var merged = Set(blacklist)
             for id in seeded { merged.insert(id) }
-            blacklist = Array(merged).sorted()
+            blacklist = Self.ensuringHostileTerminals(in: Array(merged))
             defaults.set(true, forKey: Keys.seededDefaults)
+        }
+
+        // One-time migration: existing installs already ran the seed above, so
+        // ensure AX/synth-hostile terminals (Warp) get blacklisted for them too.
+        if !defaults.bool(forKey: Keys.migratedHostileTerminals) {
+            blacklist = Self.ensuringHostileTerminals(in: blacklist)
+            defaults.set(true, forKey: Keys.migratedHostileTerminals)
         }
 
         // Enable launch-at-login once, the first time the app runs from a

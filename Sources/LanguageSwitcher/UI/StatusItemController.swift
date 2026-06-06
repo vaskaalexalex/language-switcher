@@ -122,6 +122,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         )
         revealLog.target = self
         diagMenu.addItem(revealLog)
+        let clearLog = NSMenuItem(
+            title: "Clear Log (start a fresh report)",
+            action: #selector(handleClearLog),
+            keyEquivalent: ""
+        )
+        clearLog.target = self
+        diagMenu.addItem(clearLog)
         diagnostics.submenu = diagMenu
         menu.addItem(diagnostics)
 
@@ -164,5 +171,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     @objc private func handleRevealLog() {
         Diagnostics.revealLogInFinder()
+    }
+
+    @objc private func handleClearLog() {
+        Diagnostics.clearLog()
     }
 }

@@ -47,7 +47,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Diagnostics")
                     .font(.headline)
-                Text("If a conversion misbehaves, copy the recent logs and send them to the developer. They include each conversion's before → after text and which method was used.")
+                Text("If a conversion misbehaves, copy the logs (the last 5 conversions) and send them to the developer. They include each conversion's before → after text and which method was used.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 HStack {
@@ -58,6 +58,10 @@ struct SettingsView: View {
                     }
                     Button("Reveal Log in Finder") {
                         Diagnostics.revealLogInFinder()
+                    }
+                    Button("Clear Log") {
+                        Diagnostics.clearLog()
+                        logsCopied = false
                     }
                 }
             }

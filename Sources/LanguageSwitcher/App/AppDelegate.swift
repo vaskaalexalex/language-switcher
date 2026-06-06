@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.info("=== LanguageSwitcher launching (pid=\(ProcessInfo.processInfo.processIdentifier)) ===")
+        Log.trimIfNeeded()
         NSApp.setActivationPolicy(.accessory)
 
         Installer.performPostInstallHousekeeping()

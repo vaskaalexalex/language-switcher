@@ -13,6 +13,36 @@ enum Log {
 
     private static let queue = DispatchQueue(label: "punto.log")
 
+    private static let maxBytes = 256_000
+    private static let keepBytes = 128_000
+
+    /// Keep the log from growing without bound: when it exceeds `maxBytes`,
+    /// rewrite it to the most recent `keepBytes`. Otherwise the file fills with
+    /// weeks-old entries and the diagnostics export surfaces stale history
+    /// instead of the conversion the user is trying to report. Call at launch.
+    static func trimIfNeeded() {
+        queue.async {
+            guard let data = try? Data(contentsOf: url), data.count > maxBytes else { return }
+            let kept = trimmedTail(data, keepBytes: keepBytes)
+            try? kept.write(to: url, options: .atomic)
+        }
+    }
+
+    /// Pure: the last `keepBytes` of `data`. If the cut lands in the middle of
+    /// a line, advance to the start of the next line so the result begins on a
+    /// clean log entry; if it lands exactly on a line boundary, keep that line.
+    static func trimmedTail(_ data: Data, keepBytes: Int) -> Data {
+        guard data.count > keepBytes else { return data }
+        let bytes = [UInt8](data)
+        var start = bytes.count - keepBytes
+        if start > 0 && bytes[start - 1] != 0x0A {
+            var i = start
+            while i < bytes.count && bytes[i] != 0x0A { i += 1 }
+            if i < bytes.count { start = i + 1 }
+        }
+        return Data(bytes[start...])
+    }
+
     private static let dateFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss.SSS"

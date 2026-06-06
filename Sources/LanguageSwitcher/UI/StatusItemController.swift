@@ -33,15 +33,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     func install() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        // Stable autosave key + force-visible on every launch so the icon always
-        // comes back, even if it was previously dragged off the menu bar (which
-        // otherwise persists a hidden state that survives relaunches).
-        item.autosaveName = "languageSwitcherStatusItem"
-        item.isVisible = true
-        Log.info("StatusItem install: mainThread=\(Thread.isMainThread) button=\(item.button != nil) visible=\(item.isVisible) buttonWindow=\(item.button?.window != nil) policy=\(NSApp.activationPolicy().rawValue)")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak item] in
-            Log.info("StatusItem +1s: visible=\(item?.isVisible ?? false) buttonWindow=\(item?.button?.window != nil) winOnScreen=\(item?.button?.window?.isOnActiveSpace ?? false) policy=\(NSApp.activationPolicy().rawValue)")
-        }
         if let button = item.button {
             let image = NSImage(systemSymbolName: "arrow.left.arrow.right", accessibilityDescription: "LanguageSwitcher")
             image?.isTemplate = true

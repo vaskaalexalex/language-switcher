@@ -23,9 +23,30 @@ struct LayoutConverterTests {
 
     @Test
     func testLayoutPunctuationConvertsForEnglishInput() {
-        #expect(LayoutConverter.convert("What.") == "Црфею")
-        #expect(LayoutConverter.convert("hello, world!") == "руддщб цщкдв!")
+        // Trailing punctuation (no letter after it) is real punctuation — keep it.
+        #expect(LayoutConverter.convert("What.") == "Црфе.")
+        #expect(LayoutConverter.convert("hello, world!") == "руддщ, цщкдв!")
         #expect(LayoutConverter.convert("Test123") == "Еуые123")
+    }
+
+    @Test
+    func testTrailingPunctuationIsPreservedForEnglishInput() {
+        // Regression: a period typed after a wrong-layout word must stay a period,
+        // not become the layout letter "ю" ("Ghbdtn." -> "Приветю").
+        #expect(LayoutConverter.convert("Ghbdtn.") == "Привет.")
+        #expect(LayoutConverter.convert("Ghbdtn. ") == "Привет. ")
+        #expect(LayoutConverter.convert("ghbdtn,") == "привет,")
+        #expect(LayoutConverter.convert(".") == ".")
+    }
+
+    @Test
+    func testLeadingAndInteriorPunctuationKeysStillConvert() {
+        // Punctuation keys that carry a Russian letter still convert when they lead
+        // or sit inside a word run (next char is a letter).
+        #expect(LayoutConverter.convert("[jhjij") == "хорошо")   // х leads the word
+        #expect(LayoutConverter.convert("'nj") == "это")         // э leads the word
+        #expect(LayoutConverter.convert(",sk") == "был")         // б leads the word
+        #expect(LayoutConverter.convert("e,hfk") == "убрал")     // б inside the word
     }
 
     @Test

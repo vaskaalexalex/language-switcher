@@ -56,6 +56,15 @@ enum LayoutConverter {
         return mapped
     }
 
+    /// True when the character right after `index` is a letter (any script).
+    /// Used to tell a word-internal/leading punctuation key (a layout letter, e.g.
+    /// the `,` in "e,hfk" → "убрал") from a trailing real punctuation mark (the `.`
+    /// in "Ghbdtn." → "Привет.").
+    private static func nextIsLetter(_ chars: [Character], after index: Int) -> Bool {
+        let next = index + 1
+        return next < chars.count && chars[next].isLetter
+    }
+
     static func convert(_ input: String) -> String {
         if input.isEmpty { return input }
 
@@ -73,12 +82,14 @@ enum LayoutConverter {
 
     /// Mixed-script token: Latin + physical keys that map to RU letters → RU; Cyrillic → keep.
     private static func convertMixed(_ input: String) -> String {
+        let chars = Array(input)
         var out = String()
-        out.reserveCapacity(input.count)
-        for ch in input {
+        out.reserveCapacity(chars.count)
+        for i in chars.indices {
+            let ch = chars[i]
             if isLatin(ch), let mapped = enToRu[ch] {
                 out.append(mapped)
-            } else if let mapped = mapsToLetter(ch, in: enToRu) {
+            } else if let mapped = mapsToLetter(ch, in: enToRu), nextIsLetter(chars, after: i) {
                 out.append(mapped)
             } else {
                 out.append(ch)
@@ -88,12 +99,14 @@ enum LayoutConverter {
     }
 
     private static func convertWithTable(_ input: String, table: [Character: Character]) -> String {
+        let chars = Array(input)
         var out = String()
-        out.reserveCapacity(input.count)
-        for ch in input {
+        out.reserveCapacity(chars.count)
+        for i in chars.indices {
+            let ch = chars[i]
             if ch.isLetter, let mapped = table[ch] {
                 out.append(mapped)
-            } else if let mapped = mapsToLetter(ch, in: table) {
+            } else if let mapped = mapsToLetter(ch, in: table), nextIsLetter(chars, after: i) {
                 out.append(mapped)
             } else {
                 out.append(ch)

@@ -161,19 +161,32 @@ final class TextReplacer {
                 }
             }
         } else {
-            Log.info("No AX data, using synth + char-grow")
-            KeyboardSynth.selectPreviousWord()
-            let selectionElement = usesPastePipeline ? nil : element
-            selected = await waitForSelection(
-                element: selectionElement,
-                viaClipboard: true,
-                maxAttempts: 5,
-                pollNanoseconds: 8_000_000)
-            if !selected.isEmpty {
-                let grown = await growSelectionLeftToWhitespace(initial: selected)
-                if grown != selected {
-                    Log.info("Grew selection len \(selected.count) -> \(grown.count)")
-                    selected = grown
+            // Electron/terminal AX can't see a live selection (it reports
+            // len=0 even with text highlighted). Probe the real selection with a
+            // plain copy *before* touching it: if the user already selected
+            // something, convert exactly that and never fire a word-select —
+            // ⌥⇧← would extend their selection onto neighbouring words (the
+            // "selected у2у, got Добавил у2у" bug).
+            let probe = usesPastePipeline ? await clipboardRead() : ""
+            if Self.isGenuineSelectionProbe(probe) {
+                Log.info("Pre-existing selection via clipboard (\(probe.count) chars); converting as-is")
+                selected = probe
+                selectionState = .axNative
+            } else {
+                Log.info("No AX data, using synth + char-grow")
+                KeyboardSynth.selectPreviousWord()
+                let selectionElement = usesPastePipeline ? nil : element
+                selected = await waitForSelection(
+                    element: selectionElement,
+                    viaClipboard: true,
+                    maxAttempts: 5,
+                    pollNanoseconds: 8_000_000)
+                if !selected.isEmpty {
+                    let grown = await growSelectionLeftToWhitespace(initial: selected)
+                    if grown != selected {
+                        Log.info("Grew selection len \(selected.count) -> \(grown.count)")
+                        selected = grown
+                    }
                 }
             }
         }
@@ -416,6 +429,22 @@ final class TextReplacer {
         if currentValue == expectedFullText { return .applied }
         if let preValue, currentValue != preValue { return .ambiguous }
         return .notApplied
+    }
+
+    /// Distinguishes a real user selection from an editor's empty-selection
+    /// "copy line" behavior, for the case where AX can't expose the selection
+    /// (Electron reports `loc=0 len=0` even with text highlighted). We probe the
+    /// selection with a plain Cmd+C; but VSCode/Cursor copy the *whole current
+    /// line* — trailing newline included — when nothing is selected, so a
+    /// non-empty clipboard alone doesn't prove a selection exists. Treat the
+    /// probe as genuine only when it has visible content and is not
+    /// newline-terminated (the tell-tale of a whole-line copy).
+    static func isGenuineSelectionProbe(_ copied: String) -> Bool {
+        guard copied.contains(where: { !$0.isWhitespace }) else { return false }
+        // `Character.isNewline` covers \n, \r and the \r\n grapheme (Swift folds
+        // CRLF into one Character, so `hasSuffix("\n")` would miss it).
+        if let last = copied.last, last.isNewline { return false }
+        return true
     }
 
     /// Number of caret-stop key presses (⇧←) needed to traverse `token`.

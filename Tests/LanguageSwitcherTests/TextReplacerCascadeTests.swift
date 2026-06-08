@@ -128,4 +128,33 @@ struct TextReplacerCascadeTests {
         #expect(("🇷🇺" as NSString).length == 4)
         #expect(TextReplacer.synthSelectionSteps(for: "🇷🇺") == 1)
     }
+
+    // MARK: - isGenuineSelectionProbe (don't extend a live Electron selection)
+
+    @Test
+    func testInlineSelectionIsGenuine() {
+        // The reported case: AX can't see it, but the user really did select
+        // "у2у" — converting it as-is must win over a word-select that would
+        // grab "Добавил у2у".
+        #expect(TextReplacer.isGenuineSelectionProbe("у2у"))
+        #expect(TextReplacer.isGenuineSelectionProbe("Добавил у2у"))
+        #expect(TextReplacer.isGenuineSelectionProbe("у2у "))
+    }
+
+    @Test
+    func testEmptySelectionLineCopyIsNotGenuine() {
+        // VSCode/Cursor copy the whole line (trailing newline) when nothing is
+        // selected — must NOT be mistaken for a real selection.
+        #expect(!TextReplacer.isGenuineSelectionProbe("Добавил у2у\n"))
+        #expect(!TextReplacer.isGenuineSelectionProbe("kit \r\n"))
+        #expect(!TextReplacer.isGenuineSelectionProbe("\n"))
+    }
+
+    @Test
+    func testEmptyOrWhitespaceProbeIsNotGenuine() {
+        // No selection (clipboard unchanged) or whitespace-only -> nothing to do.
+        #expect(!TextReplacer.isGenuineSelectionProbe(""))
+        #expect(!TextReplacer.isGenuineSelectionProbe("   "))
+        #expect(!TextReplacer.isGenuineSelectionProbe("\t"))
+    }
 }

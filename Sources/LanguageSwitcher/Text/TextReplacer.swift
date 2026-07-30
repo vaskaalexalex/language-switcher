@@ -31,14 +31,27 @@ final class TextReplacer {
             Log.info("No focused AX element")
         }
 
+        let isElectron = FrontmostApp.isElectron(frontmost)
+        let isForcePaste = FrontmostApp.isForcePasteApp(frontmost)
+        var summary = ConversionSummary(
+            app: frontmost?.bundleIdentifier ?? "nil",
+            electron: isElectron,
+            forcePaste: isForcePaste,
+            role: element.flatMap {
+                AccessibilityBridge.stringAttribute($0, kAXRoleAttribute as String)
+            } ?? "nil",
+            valueSettable: element.map {
+                AccessibilityBridge.isAttributeSettable($0, kAXValueAttribute as String)
+            } ?? false)
+
         if let element, AccessibilityBridge.isSecureField(element) {
             Log.info("Secure field, skipping")
+            summary.outcome = .skipped
+            Log.info(summary.line)
             NSSound.beep()
             return
         }
 
-        let isElectron = FrontmostApp.isElectron(frontmost)
-        let isForcePaste = FrontmostApp.isForcePasteApp(frontmost)
         // A rich-text element (contenteditable, `AXAttributedStringForRange`)
         // is hostile to *both* AX writes, not just the AXValue one. In Firefox
         // + Gmail the `kAXSelectedTextAttribute` write landed on a span of the
@@ -51,6 +64,7 @@ final class TextReplacer {
         // path verifies the selection by copying it and comparing the real
         // content, so it never trusts an AX offset.
         let isRichText = element.map(AccessibilityBridge.supportsAttributedText) ?? false
+        summary.richText = isRichText
         if isRichText {
             Log.info("Rich-text element detected, AX writes disabled")
         }
@@ -66,6 +80,7 @@ final class TextReplacer {
             AccessibilityBridge.rangeAttribute($0, kAXSelectedTextRangeAttribute as String)
         }
         let hasSelection = (axRange?.length ?? 0) > 0
+        summary.selection = hasSelection
         var selectionState: SelectionState = hasSelection ? .axNative : .unknown
         if let r = axRange {
             Log.info("AX range loc=\(r.location) len=\(r.length)")
@@ -88,6 +103,23 @@ final class TextReplacer {
                     .map { TokenTarget(start: $0.start, length: $0.length, snippet: $0.snippet) }
             }
         }
+        if let element {
+            // The pre-write state of the field, in one line. Without it a bug
+            // report can only say "the text came out wrong" — with it the log
+            // shows what the caret sat in and whether AX writes were even
+            // permitted, which is what separates a bad target range from a
+            // hostile app.
+            Log.info(
+                "Field role=\(summary.role) "
+                + "subrole=\(AccessibilityBridge.stringAttribute(element, kAXSubroleAttribute as String) ?? "nil") "
+                + "richText=\(isRichText) "
+                + "settable(value=\(summary.valueSettable) "
+                + "selText=\(AccessibilityBridge.isAttributeSettable(element, kAXSelectedTextAttribute as String))) "
+                + "len=\(axFullText.map { ($0 as NSString).length }.map(String.init) ?? "nil") "
+                + "caret=\(caretPosition.map(String.init) ?? "nil") "
+                + "text=\(Self.fieldWindow(axFullText, caret: caretPosition))")
+        }
+
         if let t = axTarget {
             Log.info("AX token target: range=(\(t.start),\(t.length)) snippet=\(t.snippet.debugDescription)")
         }
@@ -203,6 +235,12 @@ final class TextReplacer {
 
         guard !selected.isEmpty else {
             Log.info("Nothing to convert, beep")
+            // A silent trigger is a bug report too ("I tapped and nothing
+            // happened"), so it gets the same one-line summary — with the field
+            // snapshot above it, the log shows why nothing was picked up.
+            summary.outcome = .empty
+            summary.post = Self.fieldWindow(axFullText, caret: caretPosition, window: 32)
+            Log.info(summary.line)
             NSSound.beep()
             return
         }
@@ -228,19 +266,37 @@ final class TextReplacer {
                 in: full, start: t.start, length: t.length, replacement: converted)
         }()
 
+        summary.original = selected
+        summary.converted = converted
+
         var replacementSucceeded = false
         var usedPastePath = false
 
         if usesPastePipeline {
             Log.info("Paste pipeline: replacing real selection via paste")
-            await pasteReplacement(converted)
+            // No polling verification here: these apps' AXValue lags or lies,
+            // so polling only adds ~200 ms to every conversion. The single
+            // post-settle read inside `pasteReplacement` is free and still
+            // upgrades the outcome to `verified` when AX does tell the truth.
+            let verified = await pasteReplacement(
+                converted,
+                element: element,
+                expectedFullText: expectedFullText,
+                settleNanoseconds: 150_000_000,
+                pollForVerification: false)
             replacementSucceeded = true
             usedPastePath = true
+            summary.via = "pipeline-paste"
+            summary.outcome = verified ? .verified : .assumed
         }
 
         if !replacementSucceeded, let element, !isRichText, let t = replacementTarget, let full = axFullText {
             replacementSucceeded = await tryAXValueReplacement(
                 element: element, fullText: full, target: t, converted: converted)
+            if replacementSucceeded {
+                summary.via = "ax-value"
+                summary.outcome = .verified
+            }
         }
 
         if !replacementSucceeded, let element {
@@ -255,6 +311,10 @@ final class TextReplacer {
                 element: element,
                 converted: converted,
                 expectedFullText: expectedFullText)
+            if replacementSucceeded {
+                summary.via = "ax-selected-text"
+                summary.outcome = .verified
+            }
         }
 
         // Idempotency guard — the core fix for the "converted text is
@@ -274,6 +334,8 @@ final class TextReplacer {
             if applied {
                 Log.info("AX write already applied; skipping paste to avoid duplicate")
                 replacementSucceeded = true
+                summary.via = "ax-late-verify"
+                summary.outcome = .verified
             } else {
                 let current = AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String)
                 if Self.classifyAXWrite(
@@ -288,6 +350,8 @@ final class TextReplacer {
                         "Field changed after AX write; skipping paste to avoid duplicate "
                         + "(now=\(Self.logSnippet(current)) expected=\(Self.logSnippet(expectedFullText)))")
                     replacementSucceeded = true
+                    summary.via = "ax-ambiguous"
+                    summary.outcome = .assumed
                 }
             }
         }
@@ -299,12 +363,16 @@ final class TextReplacer {
                     selectionState = .synth(length: t.length)
                 }
             }
-            await pasteReplacement(
+            let verified = await pasteReplacement(
                 converted,
                 element: element,
-                expectedFullText: expectedFullText)
+                expectedFullText: expectedFullText,
+                settleNanoseconds: 60_000_000,
+                pollForVerification: true)
             replacementSucceeded = true
             usedPastePath = true
+            summary.via = "paste"
+            summary.outcome = verified ? .verified : .assumed
         }
 
         if replacementSucceeded && !usedPastePath {
@@ -316,16 +384,34 @@ final class TextReplacer {
             InputSource.switchToMatch(converted)
         }
 
+        // What the field holds now, read once after every strategy has run.
+        // This is the only evidence that distinguishes a clean conversion from
+        // a mangled field when the app's own write verification can't be
+        // trusted — `planned=no` is the signature of the Firefox rich-text
+        // corruption and needs no follow-up question to the user.
+        let postValue = element.flatMap {
+            AccessibilityBridge.stringAttribute($0, kAXValueAttribute as String)
+        }
+        let postCaret = replacementTarget.map {
+            Self.caretPositionAfterReplacement(start: $0.start, converted: converted)
+        }
+        summary.pastePath = usedPastePath
+        summary.post = Self.fieldWindow(postValue, caret: postCaret, window: 32)
+        summary.planned = {
+            guard expectedFullText != nil else { return "unknown" }
+            guard let postValue else { return "unreadable" }
+            return postValue == expectedFullText ? "yes" : "no"
+        }()
+        if !replacementSucceeded {
+            summary.outcome = .failed
+        }
+
         let elapsed = (CACurrentMediaTime() - started) * 1000
         Log.info(String(format: "Conversion finished in %.0f ms", elapsed))
 
         // One grep-able line per conversion: what was there, what it became,
         // and how — this is the line a bug report should center on.
-        Log.info(
-            "SUMMARY app=\(frontmost?.bundleIdentifier ?? "nil") electron=\(isElectron) "
-            + "forcePaste=\(isForcePaste) selection=\(hasSelection) richText=\(isRichText) "
-            + "\(selected.debugDescription) -> \(converted.debugDescription) "
-            + "pastePath=\(usedPastePath) ok=\(replacementSucceeded)")
+        Log.info(summary.line)
     }
 
     // MARK: - Target computation
@@ -334,6 +420,57 @@ final class TextReplacer {
         let start: Int
         let length: Int
         let snippet: String
+    }
+
+    /// How sure we are that the conversion reached the field.
+    ///
+    /// Deliberately three-valued: reporting a plain `ok=true` for a write we
+    /// never confirmed is exactly what hid the Firefox rich-text corruption —
+    /// the log claimed success while the field held mangled text.
+    enum ReplacementOutcome: String {
+        /// The field was read back and holds the converted text.
+        case verified
+        /// The mutation was issued and nothing contradicted it, but the app
+        /// never confirmed it through AX (stale/lying AXValue).
+        case assumed
+        /// Every strategy reported failure.
+        case failed
+        /// Nothing to convert (empty field, caret with no word behind it).
+        case empty
+        /// Refused before touching anything (secure field).
+        case skipped
+    }
+
+    /// The one grep-able line per trigger. Everything needed to diagnose a
+    /// conversion without asking the user what they saw on screen: which app
+    /// and element, which strategy ran, how confident the result is, and what
+    /// the field actually held afterwards.
+    struct ConversionSummary {
+        var app: String = "nil"
+        var electron = false
+        var forcePaste = false
+        var richText = false
+        var role = "nil"
+        var valueSettable = false
+        var selection = false
+        var original = ""
+        var converted = ""
+        var via = "none"
+        var pastePath = false
+        var outcome: ReplacementOutcome = .failed
+        /// Whether the post-conversion field matches the text we planned to
+        /// write: `yes`, `no` (the field holds something else — corruption or a
+        /// foreign edit), `unreadable`, or `unknown` (no AX plan to compare).
+        var planned = "unknown"
+        var post = "nil"
+
+        var line: String {
+            "SUMMARY app=\(app) electron=\(electron) forcePaste=\(forcePaste) richText=\(richText) "
+            + "role=\(role) valueSettable=\(valueSettable) selection=\(selection) "
+            + "\(original.debugDescription) -> \(converted.debugDescription) "
+            + "via=\(via) pastePath=\(pastePath) ok=\(outcome.rawValue) "
+            + "planned=\(planned) post=\(post)"
+        }
     }
 
     private enum SelectionState {
@@ -472,6 +609,41 @@ final class TextReplacer {
         guard let value else { return "nil" }
         guard value.count > limit else { return value.debugDescription }
         return (String(value.prefix(limit)) + "…").debugDescription
+    }
+
+    /// The field around the caret, quoted, with `|` marking the caret position
+    /// and `…` marking elided text. This is the log's substitute for looking at
+    /// the user's screen: a whole document is useless in a bug report, but the
+    /// window the conversion touches shows both what was there and what the
+    /// write did to it. Offsets are UTF-16 (AX's own unit) and are snapped to
+    /// grapheme boundaries so the excerpt is never mojibake.
+    static func fieldWindow(_ value: String?, caret: Int?, window: Int = 40) -> String {
+        guard let value else { return "nil" }
+        let ns = value as NSString
+        guard ns.length > 0 else { return "\"\"" }
+
+        // Anchor both halves at the same grapheme-aligned caret. Aligning the
+        // two ranges independently makes a caret *inside* a surrogate pair
+        // expand each of them over the whole pair, and the excerpt then shows
+        // the glyph twice — a log that invents text is worse than no log.
+        let caretPosition = graphemeBoundary(ns, at: min(max(caret ?? ns.length, 0), ns.length))
+        let headStart = graphemeBoundary(ns, at: max(0, caretPosition - window))
+        let tailEnd = max(caretPosition, graphemeBoundary(ns, at: min(ns.length, caretPosition + window)))
+
+        let head = ns.substring(with: NSRange(location: headStart, length: caretPosition - headStart))
+        let tail = ns.substring(with: NSRange(location: caretPosition, length: tailEnd - caretPosition))
+        let leadingEllipsis = headStart > 0 ? "…" : ""
+        let trailingEllipsis = tailEnd < ns.length ? "…" : ""
+
+        return (leadingEllipsis + head + "|" + tail + trailingEllipsis).debugDescription
+    }
+
+    /// The start of the composed character sequence containing `offset` — i.e.
+    /// `offset` snapped left onto a grapheme boundary.
+    private static func graphemeBoundary(_ ns: NSString, at offset: Int) -> Int {
+        let clamped = min(max(offset, 0), ns.length)
+        guard clamped > 0, clamped < ns.length else { return clamped }
+        return ns.rangeOfComposedCharacterSequence(at: clamped).location
     }
 
     /// Number of caret-stop key presses (⇧←) needed to traverse `token`.
@@ -879,12 +1051,28 @@ final class TextReplacer {
 
     // MARK: - Pasteboard write
 
+    /// Pastes `text` over whatever is currently selected.
+    ///
+    /// - Parameters:
+    ///   - settleNanoseconds: how long the converted text must stay on the
+    ///     pasteboard before the user's clipboard is restored. Synthetic Cmd+V
+    ///     is consumed asynchronously, so restoring too early lets the app
+    ///     paste stale text; the polling path has already waited and needs
+    ///     less.
+    ///   - pollForVerification: poll AXValue until it matches the plan. Only
+    ///     worth it where AXValue is trustworthy — on the paste pipeline
+    ///     (Electron, rich text, terminals) it just burns ~200 ms before
+    ///     failing anyway.
+    /// - Returns: `true` only when AXValue was observed to hold
+    ///   `expectedFullText`. `false` means *unverified*, not *failed*.
     @MainActor
     private func pasteReplacement(
         _ text: String,
-        element: AXUIElement? = nil,
-        expectedFullText: String? = nil
-    ) async {
+        element: AXUIElement?,
+        expectedFullText: String?,
+        settleNanoseconds: UInt64,
+        pollForVerification: Bool
+    ) async -> Bool {
         let pb = NSPasteboard.general
         let saved = savePasteboard(pb)
 
@@ -894,8 +1082,9 @@ final class TextReplacer {
         let pasteStarted = CACurrentMediaTime()
         KeyboardSynth.paste()
 
-        if let element, let expectedFullText {
-            let verified = await waitUntil(pollNanoseconds: 8_000_000, maxAttempts: 25) {
+        var verified = false
+        if pollForVerification, let element, let expectedFullText {
+            verified = await waitUntil(pollNanoseconds: 8_000_000, maxAttempts: 25) {
                 guard let current = AccessibilityBridge.stringAttribute(
                     element, kAXValueAttribute as String
                 ) else { return false }
@@ -905,18 +1094,25 @@ final class TextReplacer {
         }
 
         let elapsedNs = UInt64((CACurrentMediaTime() - pasteStarted) * 1_000_000_000)
-        // When we can verify against AXValue we already polled until the field
-        // changed, so a short settle is enough. When we can't (the Electron
-        // paste path passes no element), hold the converted text on the
-        // pasteboard longer: synthetic Cmd+V is consumed asynchronously, and
-        // restoring the clipboard too early lets the app paste stale text.
-        let canVerify = element != nil && expectedFullText != nil
-        let minNs: UInt64 = canVerify ? 60_000_000 : 150_000_000
-        if elapsedNs < minNs {
-            try? await Task.sleep(nanoseconds: minNs - elapsedNs)
+        if elapsedNs < settleNanoseconds {
+            try? await Task.sleep(nanoseconds: settleNanoseconds - elapsedNs)
         }
 
         restorePasteboard(pb, items: saved)
+
+        // One read after the settle, on every path: it costs nothing and turns
+        // "we pasted and hoped" into evidence whenever the app's AXValue does
+        // reflect the edit.
+        if !verified, let element, let expectedFullText {
+            let current = AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String)
+            verified = current == expectedFullText
+            Log.info(
+                verified
+                    ? "Paste confirmed after settle"
+                    : "Paste unconfirmed after settle (now=\(Self.logSnippet(current)))")
+        }
+
+        return verified
     }
 
     // MARK: - Pasteboard save/restore

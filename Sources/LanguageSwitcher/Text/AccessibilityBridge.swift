@@ -50,6 +50,16 @@ enum AccessibilityBridge {
         return err == .success
     }
 
+    /// Whether the app will accept a write to `attribute`. Logged per trigger:
+    /// an element that reports `AXValue`/`AXSelectedText` as read-only explains
+    /// a failed AX write outright, instead of leaving the cascade's fallbacks to
+    /// be reverse-engineered from a bug report.
+    static func isAttributeSettable(_ element: AXUIElement, _ attribute: String) -> Bool {
+        var settable: DarwinBoolean = false
+        let err = AXUIElementIsAttributeSettable(element, attribute as CFString, &settable)
+        return err == .success && settable.boolValue
+    }
+
     static func supportsAttributedText(_ element: AXUIElement) -> Bool {
         var value: CFArray?
         let err = AXUIElementCopyParameterizedAttributeNames(element, &value)

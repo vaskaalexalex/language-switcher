@@ -173,4 +173,73 @@ struct TextReplacerCascadeTests {
         let snippet = TextReplacer.logSnippet(long, limit: 10)
         #expect(snippet == "\"яяяяяяяяяя…\"")
     }
+
+    // MARK: - fieldWindow (the log's stand-in for looking at the screen)
+
+    @Test
+    func testCaretIsMarkedAndSurroundingTextKept() {
+        let field = "Отправляю Вам справку 2ylak"
+        #expect(TextReplacer.fieldWindow(field, caret: 27) == "\"Отправляю Вам справку 2ylak|\"")
+        #expect(TextReplacer.fieldWindow(field, caret: 22, window: 6) == "\"…равку |2ylak\"")
+    }
+
+    @Test
+    func testElidedSidesAreMarked() {
+        let field = "Отправляю Вам справку 2ylak"
+        #expect(TextReplacer.fieldWindow(field, caret: 27, window: 10) == "\"…авку 2ylak|\"")
+        // Nil caret means "end of field" — the corrupted Firefox value read
+        // back after a write has no caret to report.
+        #expect(TextReplacer.fieldWindow("О2ндфл2ylak", caret: nil) == "\"О2ндфл2ylak|\"")
+    }
+
+    @Test
+    func testCaretInsideSurrogatePairDoesNotDuplicateTheGlyph() {
+        // 👍 spans UTF-16 offsets 3...4; a caret reported at 4 must snap left,
+        // not expand both halves of the window over the pair.
+        #expect(TextReplacer.fieldWindow("hi 👍 there", caret: 4, window: 3) == "\"hi |👍 …\"")
+        #expect(TextReplacer.fieldWindow("hi 👍 there", caret: 5, window: 3) == "\"… 👍| th…\"")
+        #expect(TextReplacer.fieldWindow("e\u{0301}xy", caret: 1, window: 2) == "\"|é…\"")
+    }
+
+    @Test
+    func testOutOfRangeCaretAndEmptyValueAreSafe() {
+        #expect(TextReplacer.fieldWindow("abc", caret: 99) == "\"abc|\"")
+        #expect(TextReplacer.fieldWindow("abc", caret: -5) == "\"|abc\"")
+        #expect(TextReplacer.fieldWindow("", caret: 0) == "\"\"")
+        #expect(TextReplacer.fieldWindow(nil, caret: 3) == "nil")
+    }
+
+    // MARK: - ConversionSummary (one line, no follow-up questions)
+
+    @Test
+    func testSummaryLineCarriesTheWholeDiagnosis() {
+        var summary = TextReplacer.ConversionSummary()
+        summary.app = "org.mozilla.firefox"
+        summary.richText = true
+        summary.role = "AXTextArea"
+        summary.original = "2ylak"
+        summary.converted = "2ндфл"
+        summary.via = "pipeline-paste"
+        summary.pastePath = true
+        summary.outcome = .assumed
+        summary.planned = "no"
+        summary.post = "\"О2ндфл2ylak|\""
+
+        #expect(
+            summary.line
+                == "SUMMARY app=org.mozilla.firefox electron=false forcePaste=false richText=true "
+                + "role=AXTextArea valueSettable=false selection=false "
+                + "\"2ylak\" -> \"2ндфл\" via=pipeline-paste pastePath=true ok=assumed "
+                + "planned=no post=\"О2ндфл2ylak|\"")
+    }
+
+    @Test
+    func testUnverifiedWriteIsNotReportedAsPlainSuccess() {
+        // The regression this whole line exists for: an AX write nobody
+        // confirmed must never read as an unqualified success.
+        var summary = TextReplacer.ConversionSummary()
+        summary.outcome = .assumed
+        #expect(summary.line.contains("ok=assumed"))
+        #expect(!summary.line.contains("ok=true"))
+    }
 }

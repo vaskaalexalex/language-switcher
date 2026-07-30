@@ -157,4 +157,20 @@ struct TextReplacerCascadeTests {
         #expect(!TextReplacer.isGenuineSelectionProbe("   "))
         #expect(!TextReplacer.isGenuineSelectionProbe("\t"))
     }
+
+    // MARK: - logSnippet (the ambiguous branch must show the real field value)
+
+    @Test
+    func testShortValueIsQuotedInFull() {
+        #expect(TextReplacer.logSnippet("О2ндфл2ylak") == "\"О2ндфл2ylak\"")
+        #expect(TextReplacer.logSnippet("") == "\"\"")
+        #expect(TextReplacer.logSnippet(nil) == "nil")
+    }
+
+    @Test
+    func testLongValueIsTruncatedNotDropped() {
+        let long = String(repeating: "я", count: 400)
+        let snippet = TextReplacer.logSnippet(long, limit: 10)
+        #expect(snippet == "\"яяяяяяяяяя…\"")
+    }
 }

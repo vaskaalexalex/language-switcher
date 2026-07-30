@@ -26,15 +26,6 @@ final class TextReplacer {
         let started = CACurrentMediaTime()
         let frontmost = NSWorkspace.shared.frontmostApplication
         Log.info("Trigger fired (frontmost=\(frontmost?.bundleIdentifier ?? "nil"))")
-        let isElectron = FrontmostApp.isElectron(frontmost)
-        let isForcePaste = FrontmostApp.isForcePasteApp(frontmost)
-        // Both Electron apps and AX-write-hostile terminals (Warp, Ghostty, …)
-        // bypass AX writes and replace via synthetic selection + paste.
-        let usesPastePipeline = isElectron || isForcePaste
-        if usesPastePipeline {
-            Log.info("Paste pipeline for \(frontmost?.bundleIdentifier ?? "nil") (electron=\(isElectron) forcePaste=\(isForcePaste))")
-        }
-
         let element = AccessibilityBridge.focusedElement()
         if element == nil {
             Log.info("No focused AX element")
@@ -46,9 +37,28 @@ final class TextReplacer {
             return
         }
 
+        let isElectron = FrontmostApp.isElectron(frontmost)
+        let isForcePaste = FrontmostApp.isForcePasteApp(frontmost)
+        // A rich-text element (contenteditable, `AXAttributedStringForRange`)
+        // is hostile to *both* AX writes, not just the AXValue one. In Firefox
+        // + Gmail the `kAXSelectedTextAttribute` write landed on a span of the
+        // browser's own choosing — "Отправляю Вам справку 2ylak" became
+        // "О2ндфл2ylak" — while AXValue kept reporting the pre-write text, so
+        // neither the write verification nor the duplicate guard could see the
+        // damage and the conversion was still reported ok. Rich text therefore
+        // goes through the same synthetic-selection + paste pipeline as
+        // Electron and the AX-write-hostile terminals (Warp, Ghostty, …): that
+        // path verifies the selection by copying it and comparing the real
+        // content, so it never trusts an AX offset.
         let isRichText = element.map(AccessibilityBridge.supportsAttributedText) ?? false
         if isRichText {
-            Log.info("Rich-text element detected, skipping AX value write")
+            Log.info("Rich-text element detected, AX writes disabled")
+        }
+        let usesPastePipeline = isElectron || isForcePaste || isRichText
+        if usesPastePipeline {
+            Log.info(
+                "Paste pipeline for \(frontmost?.bundleIdentifier ?? "nil") "
+                + "(electron=\(isElectron) forcePaste=\(isForcePaste) richText=\(isRichText))")
         }
 
         // 1) Does the AX layer see an existing selection?
@@ -264,13 +274,21 @@ final class TextReplacer {
             if applied {
                 Log.info("AX write already applied; skipping paste to avoid duplicate")
                 replacementSucceeded = true
-            } else if Self.classifyAXWrite(
-                preValue: axFullText,
-                currentValue: AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String),
-                expectedFullText: expectedFullText
-            ) == .ambiguous {
-                Log.info("Field changed after AX write; skipping paste to avoid duplicate")
-                replacementSucceeded = true
+            } else {
+                let current = AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String)
+                if Self.classifyAXWrite(
+                    preValue: axFullText,
+                    currentValue: current,
+                    expectedFullText: expectedFullText
+                ) == .ambiguous {
+                    // Log what the field actually holds: this branch suppresses
+                    // the paste and reports success, so without the observed
+                    // value a mangled field looks like a clean conversion.
+                    Log.info(
+                        "Field changed after AX write; skipping paste to avoid duplicate "
+                        + "(now=\(Self.logSnippet(current)) expected=\(Self.logSnippet(expectedFullText)))")
+                    replacementSucceeded = true
+                }
             }
         }
 
@@ -445,6 +463,15 @@ final class TextReplacer {
         // CRLF into one Character, so `hasSuffix("\n")` would miss it).
         if let last = copied.last, last.isNewline { return false }
         return true
+    }
+
+    /// Quotable, length-bounded form of an AX value for the log. AXValue can be
+    /// a whole document, and the log file is size-capped, so long values are
+    /// truncated instead of dropped — a corrupted field must stay visible.
+    static func logSnippet(_ value: String?, limit: Int = 120) -> String {
+        guard let value else { return "nil" }
+        guard value.count > limit else { return value.debugDescription }
+        return (String(value.prefix(limit)) + "…").debugDescription
     }
 
     /// Number of caret-stop key presses (⇧←) needed to traverse `token`.

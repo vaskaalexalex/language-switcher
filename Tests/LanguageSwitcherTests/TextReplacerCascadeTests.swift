@@ -348,6 +348,42 @@ struct TextReplacerCascadeTests {
         #expect(!TextReplacer.shouldRetryPaste(clipboardIntact: true, fieldUnchanged: false))
     }
 
+    // MARK: - graphemesToShrinkToLastToken (a synth selection that spans too much)
+
+    @Test
+    func testSelectionThatCrossedWhitespaceShrinksToTheLastToken() {
+        // Reported case: a lagging AXValue put the caret 7 characters behind
+        // the real one, so the token target was measured against stale text and
+        // ⇧← selected `ew|" rjhjxt` instead of `rjhjxt`. Growing that selection
+        // leftwards swallowed a whole line — "захватилось больше чем ожидалось".
+        #expect(TextReplacer.graphemesToShrinkToLastToken(in: "ew|\" rjhjxt") == 5)
+        #expect(TextReplacer.graphemesToShrinkToLastToken(in: "foo bar") == 4)
+        #expect(TextReplacer.graphemesToShrinkToLastToken(in: "a  b") == 3)
+    }
+
+    @Test
+    func testSingleTokenSelectionIsLeftAlone() {
+        #expect(TextReplacer.graphemesToShrinkToLastToken(in: "rjhjxt") == 0)
+        #expect(TextReplacer.graphemesToShrinkToLastToken(in: "") == 0)
+    }
+
+    @Test
+    func testTrailingWhitespaceIsNotATokenBoundary() {
+        // "abrc " is the whole token plus the space the caret sits after —
+        // there is no word to the right to shrink onto, and this selection
+        // converts correctly today.
+        #expect(TextReplacer.graphemesToShrinkToLastToken(in: "abrc ") == 0)
+        #expect(TextReplacer.graphemesToShrinkToLastToken(in: "   ") == 0)
+        #expect(TextReplacer.graphemesToShrinkToLastToken(in: "foo\n") == 0)
+    }
+
+    @Test
+    func testShrinkCountsGraphemesNotCodeUnits() {
+        // The count drives ⇧→ presses, which move by grapheme.
+        #expect(TextReplacer.graphemesToShrinkToLastToken(in: "👍🏽 bar") == 2)
+        #expect(TextReplacer.graphemesToShrinkToLastToken(in: "привет мир") == 7)
+    }
+
     // MARK: - logSnippet (the ambiguous branch must show the real field value)
 
     @Test

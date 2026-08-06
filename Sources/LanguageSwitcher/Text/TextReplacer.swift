@@ -712,6 +712,20 @@ final class TextReplacer {
         return range.location == start && range.length == length
     }
 
+    /// Should the paste be issued a second time?
+    ///
+    /// A browser hands a page's `copy` handler data to its own process
+    /// asynchronously, so that write can land *after* we put the conversion on
+    /// the pasteboard — the app then pastes the page's text instead of ours and
+    /// the field is left looking untouched. Re-issuing is safe only while the
+    /// field still holds its pre-paste value: once something landed, a second
+    /// paste duplicates the edit, and two separate edits can't be undone with a
+    /// single Cmd+Z. If our text was still on the pasteboard, the app simply
+    /// didn't take it and offering it again changes nothing.
+    static func shouldRetryPaste(clipboardIntact: Bool, fieldUnchanged: Bool) -> Bool {
+        !clipboardIntact && fieldUnchanged
+    }
+
     static func rangeDescription(_ range: CFRange?) -> String {
         guard let range else { return "nil" }
         return "(\(range.location),\(range.length))"
@@ -1185,6 +1199,27 @@ final class TextReplacer {
             }
         }
 
+        // Wait for the pasteboard to go quiet before handing it back. A page's
+        // `copy` handler runs in the browser's renderer and its data reaches
+        // the system pasteboard through another process, so the first change we
+        // see can be followed by the real one milliseconds later. Returning at
+        // the first change lets that late write land on top of whatever we put
+        // on the pasteboard next — including the conversion we are about to
+        // paste, which is how a correct conversion ends up never reaching the
+        // field.
+        if !result.isEmpty {
+            var lastCount = pb.changeCount
+            for _ in 0..<6 {
+                try? await Task.sleep(nanoseconds: 8_000_000)
+                guard pb.changeCount != lastCount else { continue }
+                lastCount = pb.changeCount
+                if let s = pb.string(forType: .string), !s.isEmpty, s != result {
+                    Log.info("Pasteboard changed again after the copy (\(result.count) -> \(s.count) chars); taking the later write")
+                    result = s
+                }
+            }
+        }
+
         restorePasteboard(pb, items: saved)
         return result
     }
@@ -1215,43 +1250,61 @@ final class TextReplacer {
     ) async -> Bool {
         let pb = NSPasteboard.general
         let saved = savePasteboard(pb)
-
-        pb.clearContents()
-        pb.setString(text, forType: .string)
-
-        let pasteStarted = CACurrentMediaTime()
-        KeyboardSynth.paste()
+        let preValue = element.flatMap {
+            AccessibilityBridge.stringAttribute($0, kAXValueAttribute as String)
+        }
 
         var verified = false
-        if pollForVerification, let element, let expectedFullText {
-            verified = await waitUntil(pollNanoseconds: 8_000_000, maxAttempts: 25) {
-                guard let current = AccessibilityBridge.stringAttribute(
-                    element, kAXValueAttribute as String
-                ) else { return false }
-                return current == expectedFullText
+        for attempt in 1...2 {
+            pb.clearContents()
+            pb.setString(text, forType: .string)
+            let ourChangeCount = pb.changeCount
+
+            let pasteStarted = CACurrentMediaTime()
+            KeyboardSynth.paste()
+
+            if pollForVerification, let element, let expectedFullText {
+                verified = await waitUntil(pollNanoseconds: 8_000_000, maxAttempts: 25) {
+                    guard let current = AccessibilityBridge.stringAttribute(
+                        element, kAXValueAttribute as String
+                    ) else { return false }
+                    return current == expectedFullText
+                }
+                Log.info("Paste \(verified ? "verified" : "unverified")")
             }
-            Log.info("Paste \(verified ? "verified" : "unverified")")
-        }
 
-        let elapsedNs = UInt64((CACurrentMediaTime() - pasteStarted) * 1_000_000_000)
-        if elapsedNs < settleNanoseconds {
-            try? await Task.sleep(nanoseconds: settleNanoseconds - elapsedNs)
-        }
+            let elapsedNs = UInt64((CACurrentMediaTime() - pasteStarted) * 1_000_000_000)
+            if elapsedNs < settleNanoseconds {
+                try? await Task.sleep(nanoseconds: settleNanoseconds - elapsedNs)
+            }
 
-        restorePasteboard(pb, items: saved)
+            // Whether the conversion was still on the pasteboard when the app
+            // got around to reading it. This is the difference between "the app
+            // ignored our paste" and "the app pasted something else because its
+            // own clipboard write landed on top of ours" — without it both look
+            // identical in the log.
+            let clipboardIntact = pb.changeCount == ourChangeCount
 
-        // One read after the settle, on every path: it costs nothing and turns
-        // "we pasted and hoped" into evidence whenever the app's AXValue does
-        // reflect the edit.
-        if !verified, let element, let expectedFullText {
+            // One read after the settle, on every path: it costs nothing and
+            // turns "we pasted and hoped" into evidence whenever the app's
+            // AXValue does reflect the edit.
+            guard !verified, let element, let expectedFullText else { break }
             let current = AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String)
             verified = current == expectedFullText
             Log.info(
                 verified
                     ? "Paste confirmed after settle"
-                    : "Paste unconfirmed after settle (now=\(Self.logSnippet(current)))")
+                    : "Paste unconfirmed after settle (now=\(Self.logSnippet(current)) "
+                        + "pasteboard=\(clipboardIntact ? "ours" : "overwritten by the app"))")
+            if verified { break }
+
+            guard attempt == 1,
+                  Self.shouldRetryPaste(clipboardIntact: clipboardIntact, fieldUnchanged: current == preValue)
+            else { break }
+            Log.info("The app overwrote our pasteboard before reading it; re-issuing the paste once")
         }
 
+        restorePasteboard(pb, items: saved)
         return verified
     }
 

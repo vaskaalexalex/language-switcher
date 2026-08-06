@@ -124,34 +124,41 @@ final class TextReplacer {
             Log.info("AX token target: range=(\(t.start),\(t.length)) snippet=\(t.snippet.debugDescription)")
         }
 
-        // The field value we can hold a clipboard read against. A terminal's
-        // AXValue is a stale scrollback that need not contain the prompt line,
-        // so it can't vouch for anything the user just typed — there the
-        // clipboard stays the only source of truth.
-        let vouchingFullText = isForcePaste ? nil : axFullText
-
         // 3) Resolve text to convert.
         var selected = ""
         if hasSelection {
             if usesPastePipeline {
                 let copied = await clipboardRead()
-                if copied.isEmpty {
-                    Log.info("Paste-pipeline selection clipboard empty; refusing AX selected text fallback")
-                } else if let full = vouchingFullText,
-                          !Self.clipboardHoldsFieldText(copied, fullText: full) {
+                let axSlice = axFullText.flatMap { full in
+                    axRange.flatMap { Self.snippet(from: full, start: $0.location, length: $0.length) }
+                }
+                switch Self.pasteSelectionSource(
+                    copied: copied,
+                    axFullText: axFullText,
+                    axSlice: axSlice,
+                    isForcePaste: isForcePaste
+                ) {
+                case .clipboard:
+                    selected = copied
+                    if copied.isEmpty {
+                        Log.info("Paste-pipeline selection clipboard empty; refusing AX selected text fallback")
+                    } else {
+                        Log.info("Paste-pipeline existing selection read via clipboard (\(copied.count) chars)")
+                    }
+                case .axSlice(let slice):
                     // The app rewrote our copy (a page `copy` handler appending
                     // its own attribution). Convert what AX says is selected
                     // instead of the injected text.
-                    selected = axRange.flatMap {
-                        Self.snippet(from: full, start: $0.location, length: $0.length)
-                    } ?? ""
+                    selected = slice
                     Log.info(
                         "Clipboard selection (\(copied.count) chars) is not part of the field value "
-                        + "(\((full as NSString).length) chars); the app rewrote the copy. "
-                        + "Falling back to the AX selection slice (\(selected.count) chars)")
-                } else {
-                    selected = copied
-                    Log.info("Paste-pipeline existing selection read via clipboard (\(copied.count) chars)")
+                        + "(\(axFullText?.count ?? 0) chars); the app rewrote the copy. "
+                        + "Falling back to the AX selection slice (\(slice.count) chars)")
+                case .refuse:
+                    selected = ""
+                    Log.info(
+                        "Clipboard selection \(Self.logSnippet(copied)) and the AX slice "
+                        + "\(Self.logSnippet(axSlice)) share nothing; refusing to convert either")
                 }
             } else {
                 selected = axSelectedText(element)
@@ -171,18 +178,30 @@ final class TextReplacer {
                     Log.info("Synth selection verified (\(t.length) chars match AX snippet)")
                 } else {
                     let realSelection = await clipboardRead()
-                    if let full = vouchingFullText, !realSelection.isEmpty,
-                       !Self.clipboardHoldsFieldText(realSelection, fullText: full) {
-                        // Same rewritten clipboard as above. The ⇧← span we
-                        // just made may well be right — we simply can't read it
-                        // back through an app that edits every copy, and
-                        // growing a selection off text that isn't in the field
-                        // walks the selection over the user's words.
-                        selectionState = .synth(length: t.length)
-                        selected = t.snippet
-                        Log.info(
-                            "Synth verification copy (\(realSelection.count) chars) is not part of the field value; "
-                            + "the app rewrote the copy. Keeping the AX target snippet (\(t.snippet.count) chars)")
+                    let rewrittenCopy = !realSelection.isEmpty && !isForcePaste
+                        && (axFullText.map { !$0.isEmpty && !Self.clipboardHoldsFieldText(realSelection, fullText: $0) } ?? false)
+                    if rewrittenCopy {
+                        // Same rewritten clipboard as above, but here the copy
+                        // was the *only* evidence that ⇧← selected anything.
+                        // Ask AX for the range instead of assuming the burst
+                        // worked: growing a selection off text that isn't in
+                        // the field walks over the user's words, and pasting on
+                        // faith inserts into them.
+                        let synthRange = AccessibilityBridge.rangeAttribute(
+                            element, kAXSelectedTextRangeAttribute as String)
+                        if Self.synthSelectionMatchesTarget(synthRange, start: t.start, length: t.length) {
+                            selectionState = .synth(length: t.length)
+                            selected = t.snippet
+                            Log.info(
+                                "Synth verification copy (\(realSelection.count) chars) was rewritten by the app; "
+                                + "AX confirms the selection is the target (\(t.start),\(t.length))")
+                        } else {
+                            selected = ""
+                            Log.info(
+                                "Synth verification copy (\(realSelection.count) chars) was rewritten by the app and "
+                                + "AX reports selection \(Self.rangeDescription(synthRange)) instead of "
+                                + "(\(t.start),\(t.length)); refusing to paste into an unverified selection")
+                        }
                     } else if !realSelection.isEmpty {
                         Log.info("Synth selection mismatch; growing real selection from \(realSelection.debugDescription)")
                         let grown = await growSelectionLeftToWhitespace(initial: realSelection)
@@ -637,6 +656,65 @@ final class TextReplacer {
         // the way rather than drop text the caller has no replacement for.
         guard !selection.isEmpty, !field.isEmpty else { return true }
         return field.contains(selection)
+    }
+
+    /// What the paste pipeline should convert once it has copied the selection.
+    enum PasteSelectionSource: Equatable {
+        /// The copy is the field's own text — convert exactly that.
+        case clipboard
+        /// The app rewrote the copy; convert what AX reports as selected.
+        case axSlice(String)
+        /// The two sources disagree beyond repair — beep, don't guess.
+        case refuse
+    }
+
+    /// Decides what the paste pipeline converts, given the copy it just made,
+    /// the field's own value, and the AX slice for the selected range.
+    ///
+    /// Kept pure and separate from `run()` because every branch here is a
+    /// decision about writing into the user's text: fall back too eagerly and a
+    /// stale AX offset overwrites the wrong characters, fall back too late and a
+    /// page's `copy` handler dictates what gets converted.
+    ///
+    /// - A terminal (`isForcePaste`) exposes a stale scrollback as `AXValue`; it
+    ///   need not contain the prompt line the user just typed, so it may not
+    ///   veto the clipboard. Same for an unreadable value.
+    /// - The AX slice is trusted only when it shows up *inside* the copy, which
+    ///   is what makes "the app appended its own text" the sound reading. When
+    ///   the sources share nothing, AX offsets are as suspect as the clipboard —
+    ///   this is the same distrust that keeps rich text off the AX write path.
+    static func pasteSelectionSource(
+        copied: String,
+        axFullText: String?,
+        axSlice: String?,
+        isForcePaste: Bool
+    ) -> PasteSelectionSource {
+        guard !copied.isEmpty else { return .refuse }
+        guard !isForcePaste, let full = axFullText, !full.isEmpty else { return .clipboard }
+        if clipboardHoldsFieldText(copied, fullText: full) { return .clipboard }
+
+        guard let slice = axSlice, !slice.isEmpty,
+              normalizedNewlines(copied).contains(normalizedNewlines(slice))
+        else { return .refuse }
+        return .axSlice(slice)
+    }
+
+    /// Did the synthetic ⇧← burst land on exactly the token we mean to replace?
+    ///
+    /// The verification copy is worthless in an app that rewrites the clipboard,
+    /// and assuming the burst worked is how a paste ends up inserting instead of
+    /// replacing: a caret at the start of the field selects nothing (`new` lands
+    /// in front of the text — "newтуц "), and a caret past the token selects a
+    /// shifted span of the same length ("тnew"). An unreadable range is not
+    /// evidence either — it means beep, not "probably fine".
+    static func synthSelectionMatchesTarget(_ range: CFRange?, start: Int, length: Int) -> Bool {
+        guard let range else { return false }
+        return range.location == start && range.length == length
+    }
+
+    static func rangeDescription(_ range: CFRange?) -> String {
+        guard let range else { return "nil" }
+        return "(\(range.location),\(range.length))"
     }
 
     /// Web fields hand a selection back with CRLF while `AXValue` reports LF —

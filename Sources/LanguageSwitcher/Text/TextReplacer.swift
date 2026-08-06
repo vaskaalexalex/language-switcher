@@ -203,12 +203,28 @@ final class TextReplacer {
                                 + "(\(t.start),\(t.length)); refusing to paste into an unverified selection")
                         }
                     } else if !realSelection.isEmpty {
-                        Log.info("Synth selection mismatch; growing real selection from \(realSelection.debugDescription)")
-                        let grown = await growSelectionLeftToWhitespace(initial: realSelection)
+                        // A lagging AXValue sizes the ⇧← burst against stale
+                        // text, so the selection can start mid-word and already
+                        // span a whitespace boundary. Trim it back to the
+                        // trailing token before growing — growing such a
+                        // selection leftwards swallows the preceding words.
+                        var realToken = realSelection
+                        let shrinkSteps = Self.graphemesToShrinkToLastToken(in: realSelection)
+                        if shrinkSteps > 0 {
+                            let trimmed = await shrinkSelectionToLastToken(steps: shrinkSteps)
+                            if trimmed.isEmpty {
+                                Log.info("Shrinking the synth selection to its last token read back empty; keeping \(realSelection.debugDescription)")
+                            } else {
+                                Log.info("Synth selection \(realSelection.debugDescription) crossed a word boundary; shrank to \(trimmed.debugDescription)")
+                                realToken = trimmed
+                            }
+                        }
+                        Log.info("Synth selection mismatch; growing real selection from \(realToken.debugDescription)")
+                        let grown = await growSelectionLeftToWhitespace(initial: realToken)
                         selectionState = .synth(length: (grown as NSString).length)
                         selected = grown
-                        if grown != realSelection {
-                            Log.info("Grew paste-pipeline selection len \(realSelection.count) -> \(grown.count)")
+                        if grown != realToken {
+                            Log.info("Grew paste-pipeline selection len \(realToken.count) -> \(grown.count)")
                         } else {
                             Log.info("Paste-pipeline selection did not grow")
                         }
@@ -338,6 +354,24 @@ final class TextReplacer {
             usedPastePath = true
             summary.via = "pipeline-paste"
             summary.outcome = verified ? .verified : .assumed
+
+            // A page owns its keystrokes: some swallow ⌘V outright, and then
+            // the conversion just sits on the pasteboard (`pasteboard=ours` in
+            // the log) while the field never changes. Re-read the value — when
+            // it still holds exactly the text the plan was computed from,
+            // nothing landed, so writing the value cannot duplicate anything.
+            // This is the whole-value write, not the selected-text one that
+            // mangled Firefox: it replaces a range of the very string we just
+            // read back, and it verifies itself afterwards.
+            if !verified, let element, let t = replacementTarget, let full = axFullText,
+               AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String) == full {
+                Log.info("Paste left the field untouched; falling back to an AX value write")
+                if await tryAXValueReplacement(
+                    element: element, fullText: full, target: t, converted: converted) {
+                    summary.via = "pipeline-paste+ax-value"
+                    summary.outcome = .verified
+                }
+            }
         }
 
         if !replacementSucceeded, let element, !isRichText, let t = replacementTarget, let full = axFullText {
@@ -710,6 +744,24 @@ final class TextReplacer {
     static func synthSelectionMatchesTarget(_ range: CFRange?, start: Int, length: Int) -> Bool {
         guard let range else { return false }
         return range.location == start && range.length == length
+    }
+
+    /// How many graphemes to drop from the *left* edge of a synthetic selection
+    /// so that only the last whitespace-delimited token remains.
+    ///
+    /// The ⇧← burst is sized from the AX token target, but an app with a
+    /// lagging `AXValue` reports a caret behind the real one — the count is
+    /// then measured against stale text and the burst starts mid-word, ending
+    /// up spanning `ew|" rjhjxt` where the user meant `rjhjxt`. Growing such a
+    /// selection leftwards only makes it worse, so trim it to the trailing
+    /// token first. Trailing whitespace is not a boundary to shrink past: the
+    /// caret sits after it and there is no word to its right.
+    static func graphemesToShrinkToLastToken(in selection: String) -> Int {
+        let characters = Array(selection)
+        guard let lastWhitespace = characters.lastIndex(where: { $0.isWhitespace }),
+              lastWhitespace < characters.count - 1
+        else { return 0 }
+        return lastWhitespace + 1
     }
 
     /// Should the paste be issued a second time?
@@ -1092,6 +1144,25 @@ final class TextReplacer {
 
         let copied = await copySelection(pb)
         return copied == expected
+    }
+
+    /// Pull the left edge of the current selection right by `steps` graphemes
+    /// and read back what is left, so a burst that overshot into the previous
+    /// word ends up on the trailing token alone.
+    @MainActor
+    private func shrinkSelectionToLastToken(steps: Int) async -> String {
+        guard steps > 0 else { return "" }
+
+        let pb = NSPasteboard.general
+        let saved = savePasteboard(pb)
+        defer { restorePasteboard(pb, items: saved) }
+
+        for _ in 0..<steps {
+            KeyboardSynth.shrinkSelectionRightChar()
+        }
+        try? await Task.sleep(nanoseconds: 8_000_000)
+
+        return await copySelection(pb)
     }
 
     /// Select exactly `length` characters left of the caret using ⇧← bursts.

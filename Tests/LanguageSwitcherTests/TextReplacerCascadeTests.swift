@@ -322,6 +322,32 @@ struct TextReplacerCascadeTests {
                 CFRange(location: 6, length: 5), start: 6, length: 5))
     }
 
+    // MARK: - shouldRetryPaste (the app read a pasteboard that was no longer ours)
+
+    @Test
+    func testRetryWhenOurTextWasOverwrittenAndTheFieldIsUntouched() {
+        // A page `copy` handler hands its data to the browser process
+        // asynchronously, so the browser's own clipboard write can land after
+        // we put the conversion on the pasteboard — the app then pastes the
+        // page's text instead of ours and the field looks untouched.
+        #expect(TextReplacer.shouldRetryPaste(clipboardIntact: false, fieldUnchanged: true))
+    }
+
+    @Test
+    func testNoRetryOnceTheFieldChanged() {
+        // Something landed. A second paste would duplicate the edit, and two
+        // separate edits can't be undone with a single Cmd+Z.
+        #expect(!TextReplacer.shouldRetryPaste(clipboardIntact: false, fieldUnchanged: false))
+    }
+
+    @Test
+    func testNoRetryWhenOurTextSurvivedOnThePasteboard() {
+        // The app had the conversion available and still didn't take it —
+        // offering the same pasteboard again changes nothing.
+        #expect(!TextReplacer.shouldRetryPaste(clipboardIntact: true, fieldUnchanged: true))
+        #expect(!TextReplacer.shouldRetryPaste(clipboardIntact: true, fieldUnchanged: false))
+    }
+
     // MARK: - logSnippet (the ambiguous branch must show the real field value)
 
     @Test

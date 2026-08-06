@@ -200,6 +200,128 @@ struct TextReplacerCascadeTests {
         #expect(TextReplacer.clipboardHoldsFieldText("", fullText: "туц "))
     }
 
+    // MARK: - pasteSelectionSource (what the pipeline converts, and when it refuses)
+
+    private static let livelibCopy = "туц\nПодробнее на livelib.ru:\n"
+        + "https://www.livelib.ru/selection/10353-novye-strannyenew-weird"
+
+    @Test
+    func testRewrittenCopyFallsBackToTheAXSlice() {
+        #expect(
+            TextReplacer.pasteSelectionSource(
+                copied: Self.livelibCopy,
+                axFullText: "туц ",
+                axSlice: "туц",
+                isForcePaste: false
+            ) == .axSlice("туц"))
+    }
+
+    @Test
+    func testUntouchedCopyIsConvertedAsIs() {
+        #expect(
+            TextReplacer.pasteSelectionSource(
+                copied: "туц",
+                axFullText: "туц ",
+                axSlice: "туц",
+                isForcePaste: false
+            ) == .clipboard)
+    }
+
+    @Test
+    func testTerminalKeepsTheClipboardAsTheOnlyTruth() {
+        // A terminal's AXValue is a stale scrollback: the prompt line the user
+        // just typed need not be in it, so it may not veto the clipboard.
+        #expect(
+            TextReplacer.pasteSelectionSource(
+                copied: "ghbdtn",
+                axFullText: "$ ls\ntotal 0\n$ ",
+                axSlice: nil,
+                isForcePaste: true
+            ) == .clipboard)
+    }
+
+    @Test
+    func testUnreadableFieldValueKeepsTheClipboard() {
+        // Electron often exposes no AXValue at all — with nothing to compare
+        // against the guard must stay out of the way.
+        #expect(
+            TextReplacer.pasteSelectionSource(
+                copied: Self.livelibCopy,
+                axFullText: nil,
+                axSlice: nil,
+                isForcePaste: false
+            ) == .clipboard)
+    }
+
+    @Test
+    func testEmptyCopyIsRefused() {
+        #expect(
+            TextReplacer.pasteSelectionSource(
+                copied: "",
+                axFullText: "туц ",
+                axSlice: "туц",
+                isForcePaste: false
+            ) == .refuse)
+    }
+
+    @Test
+    func testFullyDivergentSourcesAreRefusedNotGuessed() {
+        // The AX slice must show up inside what the app copied — that is what
+        // makes "the app appended its own text" a safe reading. When the two
+        // sources share nothing, AX offsets are as suspect as the clipboard
+        // (the reason rich text avoids AX writes in the first place), so beep
+        // instead of pasting a guess over the user's selection.
+        #expect(
+            TextReplacer.pasteSelectionSource(
+                copied: "Подробнее на livelib.ru",
+                axFullText: "туц ",
+                axSlice: "туц",
+                isForcePaste: false
+            ) == .refuse)
+        #expect(
+            TextReplacer.pasteSelectionSource(
+                copied: Self.livelibCopy,
+                axFullText: "туц ",
+                axSlice: nil,
+                isForcePaste: false
+            ) == .refuse)
+    }
+
+    // MARK: - synthSelectionMatchesTarget (never paste into an unverified caret)
+
+    @Test
+    func testCaretAtStartSelectedNothing() {
+        // Trigger 3 of the report: caret at 0, so ⇧←×3 selects nothing. Pasting
+        // here inserts into the user's text ("newтуц ") instead of replacing.
+        #expect(
+            !TextReplacer.synthSelectionMatchesTarget(
+                CFRange(location: 0, length: 0), start: 0, length: 3))
+    }
+
+    @Test
+    func testSelectionOfRightLengthAtWrongOffsetIsRejected() {
+        // Caret at the end of "туц ": ⇧←×3 spans "уц ", not the token "туц".
+        // Pasting on the length alone would produce "тnew".
+        #expect(
+            !TextReplacer.synthSelectionMatchesTarget(
+                CFRange(location: 1, length: 3), start: 0, length: 3))
+    }
+
+    @Test
+    func testUnreadableRangeIsNotEvidence() {
+        #expect(!TextReplacer.synthSelectionMatchesTarget(nil, start: 0, length: 3))
+    }
+
+    @Test
+    func testExactTargetRangeIsAccepted() {
+        #expect(
+            TextReplacer.synthSelectionMatchesTarget(
+                CFRange(location: 0, length: 3), start: 0, length: 3))
+        #expect(
+            TextReplacer.synthSelectionMatchesTarget(
+                CFRange(location: 6, length: 5), start: 6, length: 5))
+    }
+
     // MARK: - logSnippet (the ambiguous branch must show the real field value)
 
     @Test

@@ -158,6 +158,48 @@ struct TextReplacerCascadeTests {
         #expect(!TextReplacer.isGenuineSelectionProbe("\t"))
     }
 
+    // MARK: - clipboardHoldsFieldText (the app rewrote our copy)
+
+    @Test
+    func testPageAppendedAttributionIsNotTheSelection() {
+        // The reported case: on livelib.ru a `copy` handler appends its own
+        // attribution to every clipboard write, so the pipeline's Cmd+C on a
+        // 4-char field came back with 91 chars. Converting that blob left the
+        // user's "туц" untouched (mixed script keeps Cyrillic) — "туц" never
+        // became "new".
+        let copied = "туц\nПодробнее на livelib.ru:\n"
+            + "https://www.livelib.ru/selection/10353-novye-strannyenew-weird"
+        #expect(!TextReplacer.clipboardHoldsFieldText(copied, fullText: "туц "))
+        // Same handler with nothing selected: pure attribution, no field text.
+        #expect(
+            !TextReplacer.clipboardHoldsFieldText(
+                "\nПодробнее на livelib.ru:\nhttps://www.livelib.ru/selection/10353",
+                fullText: "туц "))
+    }
+
+    @Test
+    func testGenuineSelectionComesOutOfTheField() {
+        #expect(TextReplacer.clipboardHoldsFieldText("туц", fullText: "туц "))
+        #expect(TextReplacer.clipboardHoldsFieldText("world", fullText: "hello world"))
+        #expect(TextReplacer.clipboardHoldsFieldText("hello world", fullText: "hello world"))
+    }
+
+    @Test
+    func testCrlfClipboardStillMatchesLfFieldValue() {
+        // Web fields hand back CRLF while AXValue reports LF — a genuine
+        // multi-line selection must not be read as foreign text.
+        #expect(TextReplacer.clipboardHoldsFieldText("foo\r\nbar", fullText: "foo\nbar baz"))
+        #expect(TextReplacer.clipboardHoldsFieldText("foo\rbar", fullText: "foo\nbar"))
+    }
+
+    @Test
+    func testNoEvidenceDoesNotRejectTheClipboard() {
+        // Nothing to compare against (unreadable/empty AXValue, empty copy) —
+        // the guard must stay out of the way instead of dropping the text.
+        #expect(TextReplacer.clipboardHoldsFieldText("туц", fullText: ""))
+        #expect(TextReplacer.clipboardHoldsFieldText("", fullText: "туц "))
+    }
+
     // MARK: - logSnippet (the ambiguous branch must show the real field value)
 
     @Test

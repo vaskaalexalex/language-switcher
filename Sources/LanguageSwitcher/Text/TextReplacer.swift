@@ -124,15 +124,34 @@ final class TextReplacer {
             Log.info("AX token target: range=(\(t.start),\(t.length)) snippet=\(t.snippet.debugDescription)")
         }
 
+        // The field value we can hold a clipboard read against. A terminal's
+        // AXValue is a stale scrollback that need not contain the prompt line,
+        // so it can't vouch for anything the user just typed — there the
+        // clipboard stays the only source of truth.
+        let vouchingFullText = isForcePaste ? nil : axFullText
+
         // 3) Resolve text to convert.
         var selected = ""
         if hasSelection {
             if usesPastePipeline {
-                selected = await clipboardRead()
-                if selected.isEmpty {
+                let copied = await clipboardRead()
+                if copied.isEmpty {
                     Log.info("Paste-pipeline selection clipboard empty; refusing AX selected text fallback")
+                } else if let full = vouchingFullText,
+                          !Self.clipboardHoldsFieldText(copied, fullText: full) {
+                    // The app rewrote our copy (a page `copy` handler appending
+                    // its own attribution). Convert what AX says is selected
+                    // instead of the injected text.
+                    selected = axRange.flatMap {
+                        Self.snippet(from: full, start: $0.location, length: $0.length)
+                    } ?? ""
+                    Log.info(
+                        "Clipboard selection (\(copied.count) chars) is not part of the field value "
+                        + "(\((full as NSString).length) chars); the app rewrote the copy. "
+                        + "Falling back to the AX selection slice (\(selected.count) chars)")
                 } else {
-                    Log.info("Paste-pipeline existing selection read via clipboard (\(selected.count) chars)")
+                    selected = copied
+                    Log.info("Paste-pipeline existing selection read via clipboard (\(copied.count) chars)")
                 }
             } else {
                 selected = axSelectedText(element)
@@ -152,7 +171,19 @@ final class TextReplacer {
                     Log.info("Synth selection verified (\(t.length) chars match AX snippet)")
                 } else {
                     let realSelection = await clipboardRead()
-                    if !realSelection.isEmpty {
+                    if let full = vouchingFullText, !realSelection.isEmpty,
+                       !Self.clipboardHoldsFieldText(realSelection, fullText: full) {
+                        // Same rewritten clipboard as above. The ⇧← span we
+                        // just made may well be right — we simply can't read it
+                        // back through an app that edits every copy, and
+                        // growing a selection off text that isn't in the field
+                        // walks the selection over the user's words.
+                        selectionState = .synth(length: t.length)
+                        selected = t.snippet
+                        Log.info(
+                            "Synth verification copy (\(realSelection.count) chars) is not part of the field value; "
+                            + "the app rewrote the copy. Keeping the AX target snippet (\(t.snippet.count) chars)")
+                    } else if !realSelection.isEmpty {
                         Log.info("Synth selection mismatch; growing real selection from \(realSelection.debugDescription)")
                         let grown = await growSelectionLeftToWhitespace(initial: realSelection)
                         selectionState = .synth(length: (grown as NSString).length)
@@ -584,6 +615,37 @@ final class TextReplacer {
         if currentValue == expectedFullText { return .applied }
         if let preValue, currentValue != preValue { return .ambiguous }
         return .notApplied
+    }
+
+    /// Could `copied` have come out of `fullText`?
+    ///
+    /// The paste pipeline reads the selection with a synthetic Cmd+C, but a web
+    /// page owns the `copy` event and may rewrite the clipboard: livelib.ru
+    /// appends its own "Подробнее на livelib.ru: <url>" attribution to every
+    /// copy. That turned a 4-char field ("туц ") into a 91-char blob, and since
+    /// the blob mixes scripts the converter kept the user's Cyrillic and only
+    /// mangled the injected Latin — "туц" never became "new", and the multi-line
+    /// paste that followed never landed in the single-line field.
+    ///
+    /// Text that isn't part of the field's own value is not this field's
+    /// selection, whatever the app put on the pasteboard. Callers fall back to
+    /// what AX reports instead of converting the foreign text.
+    static func clipboardHoldsFieldText(_ copied: String, fullText: String) -> Bool {
+        let selection = normalizedNewlines(copied)
+        let field = normalizedNewlines(fullText)
+        // No evidence either way (unreadable AXValue, empty copy) — stay out of
+        // the way rather than drop text the caller has no replacement for.
+        guard !selection.isEmpty, !field.isEmpty else { return true }
+        return field.contains(selection)
+    }
+
+    /// Web fields hand a selection back with CRLF while `AXValue` reports LF —
+    /// compare on one form so a genuine multi-line selection isn't read as
+    /// foreign text.
+    private static func normalizedNewlines(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
     }
 
     /// Distinguishes a real user selection from an editor's empty-selection

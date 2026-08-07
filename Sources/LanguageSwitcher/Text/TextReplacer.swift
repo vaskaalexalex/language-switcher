@@ -82,6 +82,10 @@ final class TextReplacer {
         let hasSelection = (axRange?.length ?? 0) > 0
         summary.selection = hasSelection
         var selectionState: SelectionState = hasSelection ? .axNative : .unknown
+        // Set when the app refuses to make a synthetic selection: the paste has
+        // nothing to replace and would insert at the caret, so the conversion
+        // goes straight to the AX value write, which works off offsets instead.
+        var conversionNeedsAXWrite = false
         if let r = axRange {
             Log.info("AX range loc=\(r.location) len=\(r.length)")
         }
@@ -189,18 +193,33 @@ final class TextReplacer {
                         // faith inserts into them.
                         let synthRange = AccessibilityBridge.rangeAttribute(
                             element, kAXSelectedTextRangeAttribute as String)
-                        if Self.synthSelectionMatchesTarget(synthRange, start: t.start, length: t.length) {
+                        switch Self.synthSelectionOutcome(synthRange, start: t.start, length: t.length) {
+                        case .matchesTarget:
                             selectionState = .synth(length: t.length)
                             selected = t.snippet
                             Log.info(
                                 "Synth verification copy (\(realSelection.count) chars) was rewritten by the app; "
                                 + "AX confirms the selection is the target (\(t.start),\(t.length))")
-                        } else {
+                        case .noSelection:
+                            // The app refuses synthetic selection, so there is
+                            // no span to paste over — and pasting anyway is the
+                            // regression that inserts at the caret. The plan is
+                            // unaffected by that refusal: value, token range
+                            // and snippet all came from one AX read, and the
+                            // value write needs no selection at all.
+                            selected = t.snippet
+                            conversionNeedsAXWrite = true
+                            Log.info(
+                                "The app rewrote the verification copy and produced no selection "
+                                + "(AX reports \(Self.rangeDescription(synthRange))); converting "
+                                + "(\(t.start),\(t.length)) via an AX value write instead of pasting")
+                        case .mismatched:
                             selected = ""
                             Log.info(
                                 "Synth verification copy (\(realSelection.count) chars) was rewritten by the app and "
                                 + "AX reports selection \(Self.rangeDescription(synthRange)) instead of "
-                                + "(\(t.start),\(t.length)); refusing to paste into an unverified selection")
+                                + "(\(t.start),\(t.length)); the caret is not where the target was measured "
+                                + "from, refusing to convert")
                         }
                     } else if !realSelection.isEmpty {
                         // A lagging AXValue sizes the ⇧← burst against stale
@@ -338,7 +357,31 @@ final class TextReplacer {
         var replacementSucceeded = false
         var usedPastePath = false
 
-        if usesPastePipeline {
+        // No selection was ever made, so there is nothing for a paste to
+        // replace. Convert through the value write, which addresses the token
+        // by offset — the same write that already recovers a swallowed paste
+        // below, and the only path this app leaves open.
+        if conversionNeedsAXWrite, let element, let t = replacementTarget, let full = axFullText {
+            let current = AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String)
+            if current == full {
+                replacementSucceeded = await tryAXValueReplacement(
+                    element: element, fullText: full, target: t, converted: converted)
+                if replacementSucceeded {
+                    summary.via = "ax-value-no-selection"
+                    summary.outcome = .verified
+                }
+            } else {
+                // The field moved on between the read the plan was built from
+                // and now — writing the whole value would drop whatever the
+                // user typed in between.
+                Log.info(
+                    "Field changed since the plan was computed "
+                    + "(now=\(Self.logSnippet(current)) planned from=\(Self.logSnippet(full))); "
+                    + "skipping the AX value write")
+            }
+        }
+
+        if usesPastePipeline && !conversionNeedsAXWrite {
             Log.info("Paste pipeline: replacing real selection via paste")
             // No polling verification here: these apps' AXValue lags or lies,
             // so polling only adds ~200 ms to every conversion. The single
@@ -374,7 +417,20 @@ final class TextReplacer {
             }
         }
 
-        if !replacementSucceeded, let element, !isRichText, let t = replacementTarget, let full = axFullText {
+        // Everything below either needs a selection or ends in a blind paste.
+        // When the app refused to make one, the value write above was the only
+        // safe route and its failure is the end of the road — falling through
+        // would insert the conversion at the caret.
+        if conversionNeedsAXWrite && !replacementSucceeded {
+            // The first path in this file that can reach the end of `run()`
+            // having changed nothing: every other strategy ends in a paste that
+            // reports success. So it owns the "nothing happened" beep here.
+            Log.info("AX value write failed and this app makes no selection to paste over; giving up")
+            NSSound.beep()
+        }
+
+        if !replacementSucceeded, !conversionNeedsAXWrite,
+           let element, !isRichText, let t = replacementTarget, let full = axFullText {
             replacementSucceeded = await tryAXValueReplacement(
                 element: element, fullText: full, target: t, converted: converted)
             if replacementSucceeded {
@@ -383,7 +439,7 @@ final class TextReplacer {
             }
         }
 
-        if !replacementSucceeded, let element {
+        if !replacementSucceeded, !conversionNeedsAXWrite, let element {
             if selectionState.needsSyntheticSelection, let t = replacementTarget {
                 Log.info("Ensuring selection before AX/paste replacement")
                 let synthSelection = await selectExactTokenViaSynth(graphemeCount: Self.synthSelectionSteps(for: t.snippet))
@@ -411,7 +467,7 @@ final class TextReplacer {
         // only writer that could have changed the field is us — hence an
         // unexpected change (`.ambiguous`) is also treated as "don't paste
         // again", trading a rare wrong-but-single result for never duplicating.
-        if !replacementSucceeded, let element, let expectedFullText {
+        if !replacementSucceeded, !conversionNeedsAXWrite, let element, let expectedFullText {
             let applied = await waitUntil(pollNanoseconds: 8_000_000, maxAttempts: 8) {
                 AccessibilityBridge.stringAttribute(element, kAXValueAttribute as String) == expectedFullText
             }
@@ -440,7 +496,7 @@ final class TextReplacer {
             }
         }
 
-        if !replacementSucceeded {
+        if !replacementSucceeded, !conversionNeedsAXWrite {
             if selectionState.needsSyntheticSelection, let t = replacementTarget {
                 let synthSelection = await selectExactTokenViaSynth(graphemeCount: Self.synthSelectionSteps(for: t.snippet))
                 if !synthSelection.isEmpty {
@@ -464,7 +520,9 @@ final class TextReplacer {
                 element: element, target: replacementTarget, converted: converted)
         }
 
-        if Preferences.shared.switchKeyboardLayout {
+        // Only follow the text: switching the layout after a conversion that
+        // never reached the field leaves the user typing in the other alphabet.
+        if replacementSucceeded, Preferences.shared.switchKeyboardLayout {
             InputSource.switchToMatch(converted)
         }
 
@@ -733,6 +791,20 @@ final class TextReplacer {
         return .axSlice(slice)
     }
 
+    /// What the synthetic ⇧← burst actually produced.
+    enum SynthSelectionOutcome: Equatable {
+        /// The burst landed on exactly the token — safe to paste over it.
+        case matchesTarget
+        /// The app produced no selection at all. Nothing to paste over, but the
+        /// plan (value, token range, snippet — all from one AX read) is
+        /// untouched by that refusal, so the value write can still carry the
+        /// conversion.
+        case noSelection
+        /// A selection exists somewhere else: the caret is not where the target
+        /// was measured from, so neither the paste nor the plan can be trusted.
+        case mismatched
+    }
+
     /// Did the synthetic ⇧← burst land on exactly the token we mean to replace?
     ///
     /// The verification copy is worthless in an app that rewrites the clipboard,
@@ -740,10 +812,11 @@ final class TextReplacer {
     /// replacing: a caret at the start of the field selects nothing (`new` lands
     /// in front of the text — "newтуц "), and a caret past the token selects a
     /// shifted span of the same length ("тnew"). An unreadable range is not
-    /// evidence either — it means beep, not "probably fine".
-    static func synthSelectionMatchesTarget(_ range: CFRange?, start: Int, length: Int) -> Bool {
-        guard let range else { return false }
-        return range.location == start && range.length == length
+    /// evidence of a selection either.
+    static func synthSelectionOutcome(_ range: CFRange?, start: Int, length: Int) -> SynthSelectionOutcome {
+        guard let range else { return .noSelection }
+        if range.location == start && range.length == length { return .matchesTarget }
+        return range.length == 0 ? .noSelection : .mismatched
     }
 
     /// How many graphemes to drop from the *left* edge of a synthetic selection

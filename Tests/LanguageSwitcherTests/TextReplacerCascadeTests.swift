@@ -287,39 +287,52 @@ struct TextReplacerCascadeTests {
             ) == .refuse)
     }
 
-    // MARK: - synthSelectionMatchesTarget (never paste into an unverified caret)
+    // MARK: - synthSelectionOutcome (never paste into an unverified caret)
 
     @Test
     func testCaretAtStartSelectedNothing() {
-        // Trigger 3 of the report: caret at 0, so ⇧←×3 selects nothing. Pasting
-        // here inserts into the user's text ("newтуц ") instead of replacing.
+        // Caret at 0, so ⇧←×3 selects nothing. Pasting here inserts into the
+        // user's text ("newтуц ") instead of replacing — but the AX plan is
+        // untouched by the app refusing to select, so the conversion can still
+        // go through the value write.
         #expect(
-            !TextReplacer.synthSelectionMatchesTarget(
-                CFRange(location: 0, length: 0), start: 0, length: 3))
+            TextReplacer.synthSelectionOutcome(
+                CFRange(location: 0, length: 0), start: 0, length: 3) == .noSelection)
     }
 
     @Test
     func testSelectionOfRightLengthAtWrongOffsetIsRejected() {
         // Caret at the end of "туц ": ⇧←×3 spans "уц ", not the token "туц".
-        // Pasting on the length alone would produce "тnew".
+        // A selection exists, just not where the target was measured from —
+        // the caret is elsewhere, so neither the paste nor the plan holds.
         #expect(
-            !TextReplacer.synthSelectionMatchesTarget(
-                CFRange(location: 1, length: 3), start: 0, length: 3))
+            TextReplacer.synthSelectionOutcome(
+                CFRange(location: 1, length: 3), start: 0, length: 3) == .mismatched)
     }
 
     @Test
-    func testUnreadableRangeIsNotEvidence() {
-        #expect(!TextReplacer.synthSelectionMatchesTarget(nil, start: 0, length: 3))
+    func testUnreadableRangeIsNotEvidenceOfASelection() {
+        #expect(
+            TextReplacer.synthSelectionOutcome(nil, start: 0, length: 3) == .noSelection)
     }
 
     @Test
     func testExactTargetRangeIsAccepted() {
         #expect(
-            TextReplacer.synthSelectionMatchesTarget(
-                CFRange(location: 0, length: 3), start: 0, length: 3))
+            TextReplacer.synthSelectionOutcome(
+                CFRange(location: 0, length: 3), start: 0, length: 3) == .matchesTarget)
         #expect(
-            TextReplacer.synthSelectionMatchesTarget(
-                CFRange(location: 6, length: 5), start: 6, length: 5))
+            TextReplacer.synthSelectionOutcome(
+                CFRange(location: 6, length: 5), start: 6, length: 5) == .matchesTarget)
+    }
+
+    @Test
+    func testEmptySelectionAtAnyOffsetIsNoSelection() {
+        // The app produced nothing at all — wherever it claims the caret sits,
+        // there is no span to paste over.
+        #expect(
+            TextReplacer.synthSelectionOutcome(
+                CFRange(location: 7, length: 0), start: 0, length: 3) == .noSelection)
     }
 
     // MARK: - shouldRetryPaste (the app read a pasteboard that was no longer ours)
